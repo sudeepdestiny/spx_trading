@@ -1,12 +1,12 @@
 STRATEGY_CONFIG  = {
     'symbol': '^SPX',
-    'sell_delta': 0.20,
+    'sell_delta': 0.30,
     'pos_delta_thresh': 0.25,
     'hedge_dist': 50,
     'lot_size': 100,
     'expiry_days': 7,
-    'start_date': '2024-01-05',
-    'end_date': '2024-01-10',
+    'start_date': '2025-01-01',
+    'end_date': '2026-02-19',
     'volatility': 0.15,
     'risk_free_rate': 0.05,
     "default_iv": 0.20,
@@ -22,7 +22,7 @@ system = platform.system()
 if system == "Windows":
     ROOT = Path("E:/Study/trading 2025/Trading2025")
 elif system == "Linux":
-    ROOT = Path("/home/opc/data/spx_trading")
+    ROOT = Path("/home/opc/spx_trading")
 elif system == "Darwin":
     ROOT = Path("/Users/sudeepdas/Documents/Study/spx_trading")
 else:
