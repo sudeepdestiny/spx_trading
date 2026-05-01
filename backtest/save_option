@@ -1,0 +1,249 @@
+from pathlib import Path
+import pandas as pd
+import numpy as np
+from math import log, sqrt, exp, erf, pi
+from pandas.tseries.offsets import BusinessDay
+from config import apikey_config,DATA_PATH, LOG_PATH, STRATEGY_CONFIG,PROCESSED_PATH
+
+DATA_PATH = Path(DATA_PATH)         # change if needed
+OUTPUT_PATH = Path(PROCESSED_PATH)  # change if needed
+OUTPUT_PATH.mkdir(parents=True, exist_ok=True)
+
+class save_option:
+    
+    def load_spx_intraday_bars(trade_date: str, data_path: Path = DATA_PATH) -> pd.DataFrame:
+        file_name = f"spx_5mins_{trade_date.replace('-', '_')}.parquet"
+        file_path = data_path / file_name
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Missing SPX intraday file: {file_path}")
+
+        df = pd.read_parquet(file_path).copy()
+        if df.empty:
+            raise ValueError(f"Empty SPX intraday file: {file_path}")
+
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+
+        required = ["Date", "Open", "High", "Low", "Close"]
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"SPX intraday file missing columns: {missing}")
+
+        return df.rename(columns={
+            "Date": "timestamp",
+            "Open": "spx_open",
+            "High": "spx_high",
+            "Low": "spx_low",
+            "Close": "spx_close",
+        })
+
+
+    def load_underlying_iv(trade_date: str, data_path: Path = DATA_PATH) -> float:
+        file_name = f"spx_1day_option_implied_volatility_{trade_date.replace('-', '_')}.parquet"
+        file_path = data_path / file_name
+
+        if not file_path.exists():
+            raise FileNotFoundError(f"Missing IV file: {file_path}")
+
+        df = pd.read_parquet(file_path).copy()
+        if df.empty:
+            raise ValueError(f"Empty IV file: {file_path}")
+
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date").reset_index(drop=True)
+
+        iv_col = "Close" if "Close" in df.columns else df.columns[-1]
+        iv_series = pd.to_numeric(df[iv_col], errors="coerce").dropna()
+
+        if iv_series.empty:
+            raise ValueError(f"No usable IV values found in {file_path}")
+
+        iv = float(iv_series.iloc[-1])
+
+        if iv > 3:
+            iv = iv / 100.0
+
+        return iv
+
+
+    def norm_cdf(x: float) -> float:
+        return 0.5 * (1.0 + erf(x / sqrt(2.0)))
+
+
+    def norm_pdf(x: float) -> float:
+        return (1.0 / sqrt(2.0 * pi)) * exp(-0.5 * x * x)
+
+
+    def black_scholes(S: float, K: float, T: float, r: float, sigma: float, option_type: str):
+        if any(pd.isna(v) for v in [S, K, T, r, sigma]):
+            return {
+                "price": np.nan,
+                "delta": np.nan,
+                "gamma": np.nan,
+                "vega": np.nan,
+                "theta": np.nan,
+                "rho": np.nan,
+                "d1": np.nan,
+                "d2": np.nan,
+            }
+
+        if S <= 0 or K <= 0 or T <= 0 or sigma <= 0:
+            return {
+                "price": np.nan,
+                "delta": np.nan,
+                "gamma": np.nan,
+                "vega": np.nan,
+                "theta": np.nan,
+                "rho": np.nan,
+                "d1": np.nan,
+                "d2": np.nan,
+            }
+
+        d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+        d2 = d1 - sigma * sqrt(T)
+
+        Nd1 = norm_cdf(d1)
+        Nd2 = norm_cdf(d2)
+        Nmd1 = norm_cdf(-d1)
+        Nmd2 = norm_cdf(-d2)
+        nd1 = norm_pdf(d1)
+
+        if option_type.upper() == "C":
+            price = S * Nd1 - K * exp(-r * T) * Nd2
+            delta = Nd1
+            rho = K * T * exp(-r * T) * Nd2 / 100.0
+            theta = (-(S * nd1 * sigma) / (2 * sqrt(T)) - r * K * exp(-r * T) * Nd2) / 365.0
+        else:
+            price = K * exp(-r * T) * Nmd2 - S * Nmd1
+            delta = Nd1 - 1.0
+            rho = -K * T * exp(-r * T) * Nmd2 / 100.0
+            theta = (-(S * nd1 * sigma) / (2 * sqrt(T)) + r * K * exp(-r * T) * Nmd2) / 365.0
+
+        gamma = nd1 / (S * sigma * sqrt(T))
+        vega = S * nd1 * sqrt(T) / 100.0
+
+        return {
+            "price": price,
+            "delta": delta,
+            "gamma": gamma,
+            "vega": vega,
+            "theta": theta,
+            "rho": rho,
+            "d1": d1,
+            "d2": d2,
+        }
+
+
+    def generate_strike_grid(spot_series: pd.Series, strike_step: int = 5, pct_band: float = 0.10):
+        spot_ref = float(spot_series.median())
+        low = int(np.floor((spot_ref * (1 - pct_band)) / strike_step) * strike_step)
+        high = int(np.ceil((spot_ref * (1 + pct_band)) / strike_step) * strike_step)
+        return np.arange(low, high + strike_step, strike_step)
+
+
+    def build_bs_option_chain(
+        trade_date: str,
+        data_path: Path = DATA_PATH,
+        output_path: Path = OUTPUT_PATH,
+        risk_free_rate: float = 0.045,
+        strike_step: int = 5,
+        pct_band: float = 0.10,
+        expiry_hour: int = 16,
+    ):
+        spx_df = load_spx_intraday_bars(trade_date, data_path=data_path)
+        base_iv = load_underlying_iv(trade_date, data_path=data_path)
+
+        expiry_date = (pd.Timestamp(trade_date) + BusinessDay(5)).date()
+        expiry_ts = pd.Timestamp(expiry_date) + pd.Timedelta(hours=expiry_hour)
+
+        strike_grid = generate_strike_grid(
+            spot_series=spx_df["spx_close"],
+            strike_step=strike_step,
+            pct_band=pct_band
+        )
+
+        rows = []
+
+        for _, bar in spx_df.iterrows():
+            ts = pd.Timestamp(bar["timestamp"])
+            spot = float(bar["spx_close"])
+
+            time_to_expiry_years = max((expiry_ts - ts).total_seconds(), 0.0) / (365.0 * 24 * 60 * 60)
+
+            for strike in strike_grid:
+                call = black_scholes(
+                    S=spot,
+                    K=float(strike),
+                    T=time_to_expiry_years,
+                    r=risk_free_rate,
+                    sigma=base_iv,
+                    option_type="C"
+                )
+                put = black_scholes(
+                    S=spot,
+                    K=float(strike),
+                    T=time_to_expiry_years,
+                    r=risk_free_rate,
+                    sigma=base_iv,
+                    option_type="P"
+                )
+
+                rows.append({
+                    "trade_date": pd.Timestamp(trade_date).date(),
+                    "timestamp": ts,
+                    "expiry_date": expiry_date,
+                    "dte": 5,
+                    "spot_price": spot,
+                    "spx_open": float(bar["spx_open"]),
+                    "spx_high": float(bar["spx_high"]),
+                    "spx_low": float(bar["spx_low"]),
+                    "spx_close": float(bar["spx_close"]),
+                    "strike": float(strike),
+                    "underlying_iv": float(base_iv),
+                    "risk_free_rate": float(risk_free_rate),
+                    "time_to_expiry_years": float(time_to_expiry_years),
+                    "moneyness": float(strike) / spot if spot > 0 else np.nan,
+
+                    "bs_call_price": call["price"],
+                    "call_delta": call["delta"],
+                    "call_gamma": call["gamma"],
+                    "call_vega": call["vega"],
+                    "call_theta": call["theta"],
+                    "call_rho": call["rho"],
+                    "call_d1": call["d1"],
+                    "call_d2": call["d2"],
+
+                    "bs_put_price": put["price"],
+                    "put_delta": put["delta"],
+                    "put_gamma": put["gamma"],
+                    "put_vega": put["vega"],
+                    "put_theta": put["theta"],
+                    "put_rho": put["rho"],
+                    "put_d1": put["d1"],
+                    "put_d2": put["d2"],
+                })
+
+        chain_df = pd.DataFrame(rows)
+
+        output_file = output_path / f"option_chain_5dte_5minute_{trade_date}.parquet"
+        chain_df.to_parquet(output_file, index=False)
+
+        return chain_df, output_file
+
+
+# if __name__ == "__main__":
+#     trade_date = "2026-03-20"  # change this
+#     chain_df, output_file = build_bs_option_chain(
+#         trade_date=trade_date,
+#         data_path=DATA_PATH,
+#         output_path=OUTPUT_PATH,
+#         risk_free_rate=0.045,
+#         strike_step=5,
+#         pct_band=0.10,
+#         expiry_hour=16,
+#     )
+
+#     print(f"Saved {len(chain_df):,} rows to {output_file}")
+#     print(chain_df.head())
