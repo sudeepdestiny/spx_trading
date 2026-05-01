@@ -52,9 +52,15 @@ class DeltaNeutralStrategy:
         """Select short strikes with delta >= sell_delta (closest match), then hedges."""
         sell_delta = self.config["sell_delta"]
         hedge_dist = self.config["hedge_dist"]
+        
+        
+        # bucket_df = bucket_df.rename(columns={"call_mid":"bs_call_price", "put_mid":"bs_put_price"})
 
         call_df = bucket_df.dropna(subset=["call_mid", "call_delta"]).copy()
         put_df = bucket_df.dropna(subset=["put_mid", "put_delta"]).copy()
+        
+        ##sort putdf with delta ascending (most negative first) to ensure we pick the most negative delta put for the same strike as call
+        # put_df = put_df.sort_values(by="put_delta", ascending=True)
 
         if call_df.empty or put_df.empty:
             logging.info(f"No valid calls ({len(call_df)}) or puts ({len(put_df)})")
@@ -482,7 +488,10 @@ class DeltaNeutralStrategy:
             if viable_shorts.empty:
                 return None
             # Pick closest to exact sell_delta
-            return viable_shorts.loc[viable_shorts.index.min()]
+            # Closest = smallest excess delta (guaranteed >= target)
+        # short_call = viable_calls.loc[viable_calls["call_delta"].idxmin()]
+        # short_put = viable_puts.loc[viable_puts["put_delta"].abs().idxmin()]
+            return viable_shorts.loc[viable_shorts["call_delta"].idxmin()]
         
         else:  # PE
             viable_shorts = bucket_df[
@@ -491,7 +500,7 @@ class DeltaNeutralStrategy:
             ]
             if viable_shorts.empty:
                 return None
-            return viable_shorts.loc[viable_shorts.index.min()]
+            return viable_shorts.loc[viable_shorts["put_delta"].idxmin()]
     def find_imbalanced_short_leg(self, bucket_df, current_delta):
         """Target short leg on imbalanced side using existing current_delta.
         CE for neg delta, PE for pos delta. Largest contributor.
@@ -507,15 +516,19 @@ class DeltaNeutralStrategy:
                 return pos
 
 
-    def run_backtest(self, option_chain: pd.DataFrame, trade_date=None, dte_days: float = 1.0):
+    def run_backtest(self, option_chain: pd.DataFrame, trade_date=None, dte_days: int = 1,expiry_date=None):
        
         
         if option_chain.empty:
             return pd.DataFrame(), {"status": "empty_chain"}
 
-        df = option_chain.copy()
-        df["bucket_ts"] = pd.to_datetime(df["bucket_ts"])
+        df = option_chain.copy()      
+
+        df["bucket_ts"] = pd.to_datetime(df["timestamp"])
         df = df.sort_values("bucket_ts").reset_index(drop=True)
+        # Ensure timestamps are timezone-aware before converting to Eastern
+        if not pd.api.types.is_datetime64tz_dtype(df["bucket_ts"]):
+            df["bucket_ts"] = df["bucket_ts"].dt.tz_localize("UTC")
         # Convert tz-aware UTC timestamps to Eastern and filter RTH only
         df["bucket_ts_et"] = df["bucket_ts"].dt.tz_convert("US/Eastern")
         
@@ -536,23 +549,23 @@ class DeltaNeutralStrategy:
         for idx, (bucket_ts, bucket_df) in enumerate(grouped):
             last_bucket = (bucket_ts, bucket_df)
 
-            # if "spot_price" in bucket_df.columns and bucket_df["spot_price"].notna().any():
-            #     current_spot = float(bucket_df["spot_price"].dropna().iloc[0])
-            # else:
-            #     current_spot = float(bucket_df["strike"].median())
+            if "spot_price" in bucket_df.columns and bucket_df["spot_price"].notna().any():
+                current_spot = float(bucket_df["spot_price"].dropna().iloc[0])
+            else:
+                current_spot = float(bucket_df["strike"].median())
             
             # Replace the spot extraction block with:
             
              # In run_backtest loop or select_strikes
             bucket_df = self.filter_main_strike_cluster(bucket_df)
         
-            current_spot = self.get_synthetic_spot(bucket_df)
+            # current_spot = self.get_synthetic_spot(bucket_df)
 
-            bucket_df = self.add_deltas_for_bucket(
-                bucket_df,
-                spot_price=current_spot,
-                bucket_ts=bucket_ts
-            )
+            # bucket_df = self.add_deltas_for_bucket(
+            #     bucket_df,
+            #     spot_price=current_spot,
+            #     bucket_ts=bucket_ts
+            # )
 
             if not self.open_positions:
                 selection = self.select_strikes(bucket_df)
@@ -560,7 +573,9 @@ class DeltaNeutralStrategy:
                     continue
 
                 cycle_id += 1
-                expiry_date = str(trade_date) if trade_date is not None else "same_day"
+                ##add dte_days to trade_date and convert to string for logging
+                # expiry_date=pd.to_datetime(trade_date) + pd.Timedelta(days=dte_days) if trade_date is not None else "same_day"
+                
                 self.open_cycle_positions(bucket_ts, selection, expiry_date, cycle_id)
                 adjustments = 0
                 highest_pnl = 0.0
@@ -635,7 +650,7 @@ class DeltaNeutralStrategy:
                     self.close_leg_pair(bucket_df,bucket_ts,open_strike, open_type, "Close as strike imbalance")
                     break
                 
-                expiry_date = str(trade_date) if trade_date else "same_day"
+                # expiry_date = str(trade_date) if trade_date else "same_day"
                 cycle_id += 1
                 
                 self.open_single_position(

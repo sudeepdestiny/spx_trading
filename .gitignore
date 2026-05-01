@@ -1,3 +1,5 @@
 config.py
 data/spx/*.parquet
 *.pyc
+*.csv
+*.log
