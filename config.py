@@ -2,7 +2,7 @@ STRATEGY_CONFIG = {
     'symbol': '^SPX',
     'sell_delta': 0.15,
     'pos_delta_thresh': 0.25,
-    'hedge_dist': 100,
+    'hedge_dist': 150,
     'lot_size': 100,
     'dte_days': 4,  # ← Change to 0 for same-day expiry
     'start_date': '2026-03-02',
@@ -17,9 +17,10 @@ STRATEGY_CONFIG = {
     "pct_band": 0.10,
     "expiry_hour": 15,  # ← Earlier for 0 DTE (before market close)
     "price_bar_size": "5 mins",    # ← Add
-    "iv_bar_size": "30 mins",      # ← Add
+    "iv_bar_size": "30 mins",
 }
 
+import os
 import platform
 from pathlib import Path
 
@@ -46,15 +47,29 @@ print(f"Running on {system}")
 print(f"DATA_PATH = {DATA_PATH}")
 print(f"DB_PATH = {DB_PATH}")
 
+apikey_config = {
+}
+
 if system == "Linux":
-    apikey_config["ibkr_client_id"] = 1
-    apikey_config["ibkr_host"] = ""
-    apikey_config["ibkr_port"]=4002
+    apikey_config["ibkr_paper_host"] = "127.0.0.1"
+    apikey_config["ibkr_live_host"] = "127.0.0.1"
+    apikey_config["ibkr_paper_port"] = 4002
+    apikey_config["ibkr_live_port"] = 4001
+    apikey_config["ibkr_paper_client_id"] = 1
+    apikey_config["ibkr_live_client_id"] = 2
 elif system == "Windows":
-    apikey_config["ibkr_client_id"] = 1
-    apikey_config["ibkr_host"] = ""
-    apikey_config["ibkr_port"]=7497
+    apikey_config["ibkr_paper_host"] = "127.0.0.1"
+    apikey_config["ibkr_live_host"] = "127.0.0.1"
+    apikey_config["ibkr_paper_port"] = 7497
+    apikey_config["ibkr_live_port"] = 7496
+    apikey_config["ibkr_paper_client_id"] = 1
+    apikey_config["ibkr_live_client_id"] = 2
 elif system == "Darwin":
-    apikey_config["ibkr_client_id"] = 3
-    apikey_config["ibkr_host"] = ""
-    apikey_config["ibkr_port"]=7497
+    apikey_config["ibkr_paper_host"] = "127.0.0.1"
+    apikey_config["ibkr_live_host"] = "127.0.0.1"
+    apikey_config["ibkr_paper_port"] = 7497
+    apikey_config["ibkr_live_port"] = 7496
+    apikey_config["ibkr_paper_client_id"] = 3
+    apikey_config["ibkr_live_client_id"] = 4
+
+apikey_config["ibkr_trading_mode"] = os.getenv("IBKR_TRADING_MODE", "paper").lower()

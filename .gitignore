@@ -3,3 +3,4 @@ data/spx/*.parquet
 *.pyc
 *.csv
 *.log
+ssh-key-2026-03-14.key
