@@ -175,7 +175,7 @@ def run_paper_trader():
                                     
                                     if current_hour >= close_hour:
                                         logger.info(f"  Closing cycle {cycle_id} (end of trading day)")
-                                        trader.close_positions_at_expiry(cycle_id)
+                                        trader.close_positions_at_expiry(cycle_id, option_chain=option_chain, reason="eod")
                                         positions_opened_today = False
                         else:
                             logger.warning("Could not fetch option chain for monitoring")

@@ -829,12 +829,14 @@ class PaperTrader:
             return {}
     
     
-    def close_positions_at_expiry(self, cycle_id):
+    def close_positions_at_expiry(self, cycle_id, option_chain=None, reason="expiry"):
         """
         Close all positions in a cycle at expiry
         
         Args:
             cycle_id: Cycle ID to close
+            option_chain: DataFrame with current option chain data (optional)
+            reason: Close reason label
         
         Returns:
             Dict with close results (pnl, close_prices, etc.)
@@ -851,25 +853,39 @@ class PaperTrader:
                 return {}
             
             logger.info(f"Closing cycle {cycle_id} ({len(pos_data['positions'])} positions)...")
-            
-            # Close each position
-            total_pnl = 0
+
+            if option_chain is None or getattr(option_chain, "empty", True):
+                underlying = "SPX"
+                if pos_data.get("positions"):
+                    underlying = pos_data["positions"][0].get("underlying", "SPX")
+                option_chain = self.get_live_option_chain(underlying=underlying)
+
+            if option_chain is None or option_chain.empty:
+                logger.error("Cannot close positions: option_chain unavailable/empty")
+                return {}
+
+            total_pnl = 0.0
             close_details = []
-            
+
             for pos in pos_data["positions"]:
-                # TODO: Implement actual close via IBKR
-                # For now, use placeholder
-                pnl = pos.get("pnl", 0)
+                if pos.get("status") == "CLOSED":
+                    continue
+
+                closed = self._close_position(pos, option_chain, reason=reason)
+                if closed is None:
+                    continue
+
+                pnl = float(closed.get("pnl", 0.0) or 0.0)
                 total_pnl += pnl
-                
-                close_details.append({
-                    "side": pos["side"],
-                    "type": pos["type"],
-                    "strike": pos["strike"],
-                    "pnl": pnl
-                })
-                
-                logger.info(f"  Closed: {pos['side']} {pos['type']} {pos['strike']} | PnL: ${pnl:.2f}")
+                close_details.append(
+                    {
+                        "side": closed["side"],
+                        "type": closed["type"],
+                        "strike": closed["strike"],
+                        "close_price": closed.get("close_price"),
+                        "pnl": pnl,
+                    }
+                )
             
             # Update position status
             pos_data["status"] = "CLOSED"
@@ -890,7 +906,7 @@ class PaperTrader:
             return {
                 "cycle_id": cycle_id,
                 "total_pnl": total_pnl,
-                "close_count": len(pos_data["positions"]),
+                "close_count": len(close_details),
                 "close_details": close_details
             }
         
