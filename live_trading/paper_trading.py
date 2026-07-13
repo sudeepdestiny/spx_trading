@@ -9,6 +9,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backtest"))
 
 from strategy import DeltaNeutralStrategy
@@ -41,15 +42,161 @@ class PaperTrader:
         
         logger.info(f"✓ PaperTrader initialized (mode: {'PAPER' if is_paper else 'LIVE'})")
     
+    def _get_all_open_strikes(self):
+        """Helper to collect all strikes from currently open local positions."""
+        strikes = []
+        for cycle_data in self.live_positions.values():
+            if cycle_data["status"] == "OPEN":
+                strikes.extend([p["strike"] for p in cycle_data["positions"] if p["status"] == "OPEN"])
+        return list(set(strikes))
+
+    def _load_ibkr_positions_into_tracker(self, ibkr_positions):
+        """
+        Loads untracked IBKR positions into the internal live_positions tracker.
+        Groups positions by expiry to reconstruct trade cycles.
+
+        Note: Strategy-specific parameters like target_delta, hedge_dist, adjustments
+        will be set to defaults or inferred minimally.
+        """
+        logger.info(f"Attempting to load {len(ibkr_positions)} IBKR positions into tracker...")
+        
+        # Create a set of keys for positions already tracked locally
+        tracked_local_keys = set()
+        for cycle_data in self.live_positions.values():
+            for leg in cycle_data["positions"]:
+                tracked_local_keys.add((
+                    leg["underlying"], leg["expiry"], float(leg["strike"]), leg["right"], int(leg["quantity"]), leg["side"]
+                ))
+
+        # Group untracked positions by symbol and expiry to reconstruct cycles
+        from collections import defaultdict
+        untracked_by_group = defaultdict(list)
+        
+        for ibkr_pos in ibkr_positions:
+            quantity = abs(int(ibkr_pos["position"]))
+            side = "S" if ibkr_pos["position"] < 0 else "B"
+            
+            # Create a unique key to check if this specific leg is already tracked
+            current_ibkr_key = (
+                ibkr_pos["symbol"],
+                ibkr_pos["expiry"],
+                float(ibkr_pos["strike"]),
+                ibkr_pos["right"],
+                quantity,
+                side
+            )
+
+            if current_ibkr_key in tracked_local_keys:
+                continue 
+
+            group_key = (ibkr_pos["symbol"], ibkr_pos["expiry"])
+            untracked_by_group[group_key].append(ibkr_pos)
+
+        new_cycles_added = 0
+        for (symbol, expiry), legs in untracked_by_group.items():
+            self.cycle_id += 1
+            new_cycle_id = self.cycle_id
+
+            cycle_legs = []
+            for ibkr_pos in legs:
+                option_type = "CE" if ibkr_pos["right"] == "C" else "PE"
+                side = "S" if ibkr_pos["position"] < 0 else "B"
+                action = "SELL" if ibkr_pos["position"] < 0 else "BUY"
+                quantity = abs(int(ibkr_pos["position"]))
+
+                # Handle unit price calculation
+                multiplier = 100.0
+                inferred_price = ibkr_pos["avgCost"]
+                if inferred_price > 500: 
+                    inferred_price /= multiplier
+
+                leg_data = {
+                    "cycle_id": new_cycle_id,
+                    "underlying": ibkr_pos["symbol"],
+                    "expiry": ibkr_pos["expiry"],
+                    "strike": float(ibkr_pos["strike"]),
+                    "type": option_type,
+                    "right": ibkr_pos["right"],
+                    "side": side,
+                    "action": action,
+                    "quantity": quantity,
+                    "price": inferred_price,
+                    "entry_price": inferred_price,
+                    "delta": 0.0, 
+                    "order_id": None,
+                    "status": "OPEN",
+                }
+                cycle_legs.append(leg_data)
+
+            self.live_positions[new_cycle_id] = {
+                "cycle_id": new_cycle_id,
+                "entry_time": pd.Timestamp.now(),
+                "target_delta": self.strategy.config.get("sell_delta", 0.3),
+                "hedge_dist": self.strategy.config.get("hedge_dist", 150),
+                "quantity": max([l["quantity"] for l in cycle_legs]) if cycle_legs else 1,
+                "adjustments": 0,
+                "status": "OPEN",
+                "positions": cycle_legs
+            }
+            new_cycles_added += 1
+            logger.info(f"  Reconstructed Cycle {new_cycle_id} from IBKR with {len(cycle_legs)} legs for {symbol} {expiry}")
+
+        return new_cycles_added > 0
+
+    def has_open_positions(self):
+        """
+        Check if there are any currently open trade cycles.
+        If untracked SPX positions are found on IBKR and the local tracker is empty,
+        they will be loaded into the tracker as individual cycles.
+        """
+        # First check local memory
+        if any(cycle_data["status"] == "OPEN" for cycle_data in self.live_positions.values()):
+            return True
+            
+        # Fallback: Check actual IBKR account for any SPX positions
+        # This is primarily for cold starts or detecting external trades.
+        ibkr_positions = self.conn_mgr.get_all_positions()
+        spx_positions = [p for p in ibkr_positions if p['symbol'] == 'SPX' and p['position'] != 0]
+        
+        if spx_positions:
+            logger.info(f"Found {len(spx_positions)} active SPX positions on IBKR.")
+            # If the local tracker is completely empty, attempt to load these IBKR positions.
+            # This is crucial for monitor_and_adjust to see them.
+            if not self.live_positions:
+                self._load_ibkr_positions_into_tracker(spx_positions)
+                # After attempting to load, re-check if there are now open positions in the tracker.
+                # This will return True if any were successfully loaded.
+                return any(cycle_data["status"] == "OPEN" for cycle_data in self.live_positions.values())
+            else:
+                # If self.live_positions is NOT empty, but IBKR has more positions,
+                # we don't automatically load them here to avoid mixing full cycles
+                # with potentially incomplete reconstructed ones.
+                # However, the presence of *any* IBKR positions means we should
+                # still return True to prevent opening new trades.
+                logger.warning(
+                    f"Local tracker has {len(self.live_positions)} cycles, "
+                    f"but IBKR has {len(spx_positions)} SPX positions. "
+                    "Some IBKR positions might not be fully tracked by the strategy."
+                )
+                return True # Return True to prevent opening new positions
+            
+        return False
+
+    def get_broker_positions(self):
+        """Fetch raw positions directly from IBKR"""
+        return self.conn_mgr.get_all_positions()
     
-    def get_live_option_chain(self, underlying="SPX", dte_days=5):
+    def get_live_option_chain(self, underlying="SPX", dte_days=5, required_strikes=None, expiry=None):
         """
         Fetch live option chain from IBKR
         
         Args:
             underlying: Underlying symbol (e.g., "SPX")
-            strike_range: Ignored; strikes are derived as ±15 strikes from spot
-            dte_days: Target calendar days to expiry
+            dte_days: Target calendar days to expiry (ignored if expiry is provided)
+            required_strikes: Optional list of strikes that MUST be included
+            expiry: Optional explicit expiry date string (YYYYMMDD). If provided,
+                    overrides the dte_days calculation. Use this when monitoring
+                    open positions to stay on the same expiry.
         
         Returns:
             DataFrame with option prices and greeks
@@ -168,10 +315,18 @@ class PaperTrader:
                 return float(closes.iloc[-1]) if not closes.empty else None
 
             now_et = pd.Timestamp.now(tz="US/Eastern")
-            expiry_ts = now_et.normalize() + pd.Timedelta(days=dte_days, hours=16)
-            while expiry_ts.weekday() >= 5:
-                expiry_ts += pd.Timedelta(days=1)
-            expiry = expiry_ts.strftime("%Y%m%d")
+            if expiry is not None:
+                # Use the explicitly provided expiry (e.g. from open positions)
+                expiry_ts = pd.Timestamp(expiry, tz="US/Eastern").normalize() + pd.Timedelta(hours=16)
+                logger.info(f"Using explicit expiry override: {expiry}")
+            else:
+                expiry_ts = now_et.normalize() + pd.Timedelta(days=dte_days, hours=16)
+                while expiry_ts.weekday() >= 5:
+                    expiry_ts += pd.Timedelta(days=1)
+                # Holiday Check: Skip Memorial Day 2026 (May 25)
+                if expiry_ts.strftime("%Y%m%d") == "20260525":
+                    expiry_ts += pd.Timedelta(days=1)
+                expiry = expiry_ts.strftime("%Y%m%d")
             effective_dte_days = max((expiry_ts - now_et).total_seconds() / 86400, 1 / 365)
             option_trading_class = "SPXW" if underlying.upper() == "SPX" else underlying
             option_exchange = "SMART" if underlying.upper() == "SPX" else "SMART"
@@ -208,6 +363,11 @@ class PaperTrader:
             high = atm_strike + (strike_count * strike_step)
             strike_range = (low, high)
             strikes = list(range(int(low), int(high) + 1, 5))
+            
+            if required_strikes:
+                # Merge with strikes from open positions to ensure we don't lose data for OTM legs
+                strikes = sorted(list(set(strikes) | set(int(s) for s in required_strikes)))
+
             logger.info(f"Using strike range {low}-{high} from spot={spot_price:.2f}, atm={atm_strike}")
             option_requests = {}
             option_contracts = []
@@ -237,9 +397,10 @@ class PaperTrader:
 
                 for req_id, contract in chunk:
                     wrapper.price_events[req_id] = threading.Event()
-                    client.reqMktData(req_id, contract, "", False, False, [])
+                    # Request market data including generic tick 106 for Greeks/Model computation in one call
+                    client.reqMktData(req_id, contract, "106", False, False, [])
 
-                deadline = time_module.monotonic() + 6.0
+                deadline = time_module.monotonic() + 15.0
                 chunk_req_ids = [req_id for req_id, _ in chunk]
                 while time_module.monotonic() < deadline:
                     with wrapper.market_data_lock:
@@ -362,8 +523,9 @@ class PaperTrader:
         order = Order()
         order.action = position["action"]
         order.totalQuantity = int(quantity)
-        order.orderType = "LMT"
-        order.lmtPrice = float(position["price"])
+        order.orderType = "MKT"  # Changed from LMT to MKT for market order
+        # Market orders do not use lmtPrice, so this line is removed or commented out.
+        order.overridePercentageConstraints = True  # Helps bypass server-side price/data precautions
         order.tif = "DAY"
         order.transmit = True
         order.eTradeOnly = False
@@ -376,9 +538,20 @@ class PaperTrader:
     def _option_price(self, row, option_type, side):
         prefix = "call" if option_type == "CE" else "put"
         preferred = f"{prefix}_bid" if side == "S" else f"{prefix}_ask"
-        for column in (preferred, f"{prefix}_mid", f"{prefix}_model_price"):
+        
+        # Try standard market data columns
+        for column in (preferred, f"{prefix}_mid", f"{prefix}_model_price", f"{prefix}_last"):
             if column in row.index and pd.notna(row[column]) and float(row[column]) > 0:
                 return round(float(row[column]), 2)
+        
+        # Fallback: Calculate intrinsic value + small floor if market data is missing
+        # This prevents closing logic from failing due to missing quotes
+        if "spot_price" in row.index and "strike" in row.index:
+            spot = float(row["spot_price"])
+            strike = float(row["strike"])
+            intrinsic = max(0, spot - strike) if option_type == "CE" else max(0, strike - spot)
+            return round(max(0.05, intrinsic), 2)
+            
         return None
 
     def _find_hedge_row(self, chain, short_strike, option_type, hedge_dist, log_fallback=True):
@@ -463,11 +636,13 @@ class PaperTrader:
             call_candidates = chain[
                 chain["call_delta"].notna() &
                 chain["call_mid"].notna() &
+                (chain["call_mid"].notna() | chain.get("call_model_price", pd.Series([None])).notna()) &
                 (chain["call_delta"] > 0)
             ].copy()
             put_candidates = chain[
                 chain["put_delta"].notna() &
                 chain["put_mid"].notna() &
+                (chain["put_mid"].notna() | chain.get("put_model_price", pd.Series([None])).notna()) &
                 (chain["put_delta"] < 0)
             ].copy()
 
@@ -745,7 +920,12 @@ class PaperTrader:
                 short_type = "CE" if current_delta > 0 else "PE"
                 short_pos = self._find_open_short(pos_data["positions"], short_type)
                 if short_pos is None:
-                    logger.warning(f"  Cycle {cycle_id}: no open {short_type} short to adjust")
+                    # Only warn if there is actually a short on the other side (suggesting a strangle)
+                    # This avoids noise for single-leg cycles reconstructed from IBKR
+                    other_type = "PE" if short_type == "CE" else "CE"
+                    if self._find_open_short(pos_data["positions"], other_type):
+                        logger.warning(f"  Cycle {cycle_id}: no open {short_type} short to adjust (current_delta={current_delta:.4f})")
+                        
                     results[cycle_id] = {"status": "missing_short", "current_delta": current_delta}
                     continue
 
@@ -852,13 +1032,16 @@ class PaperTrader:
                 logger.warning(f"Cycle {cycle_id} is already {pos_data['status']}")
                 return {}
             
+            # Ensure we fetch market data for the specific strikes in this cycle
+            needed_strikes = [p["strike"] for p in pos_data["positions"] if p["status"] == "OPEN"]
+            
             logger.info(f"Closing cycle {cycle_id} ({len(pos_data['positions'])} positions)...")
 
             if option_chain is None or getattr(option_chain, "empty", True):
                 underlying = "SPX"
                 if pos_data.get("positions"):
                     underlying = pos_data["positions"][0].get("underlying", "SPX")
-                option_chain = self.get_live_option_chain(underlying=underlying)
+                option_chain = self.get_live_option_chain(underlying=underlying, required_strikes=needed_strikes)
 
             if option_chain is None or option_chain.empty:
                 logger.error("Cannot close positions: option_chain unavailable/empty")
@@ -940,6 +1123,36 @@ class PaperTrader:
             logger.error(f"Error calculating portfolio delta: {e}")
             return 0.0
     
+    def get_live_positions_details(self):
+        """
+        Returns a formatted string with details of all open live positions.
+        """
+        details_str = []
+        open_cycles_found = False
+
+        for cycle_id, cycle_data in self.live_positions.items():
+            if cycle_data["status"] == "OPEN":
+                open_cycles_found = True
+                details_str.append(f"--- Cycle ID: {cycle_id} ---")
+                details_str.append(f"  Status: {cycle_data['status']}")
+                details_str.append(f"  Entry Time: {cycle_data['entry_time'].strftime('%Y-%m-%d %H:%M:%S')}")
+                details_str.append(f"  Target Delta: {cycle_data['target_delta']:.3f}")
+                details_str.append(f"  Hedge Distance: {cycle_data['hedge_dist']}")
+                details_str.append(f"  Quantity per leg: {cycle_data['quantity']}")
+                details_str.append(f"  Adjustments made: {cycle_data['adjustments']}")
+                details_str.append("  Legs:")
+                for leg in cycle_data["positions"]:
+                    if leg["status"] == "OPEN":
+                        details_str.append(
+                            f"    - {leg['action']} {leg['quantity']} {leg['type']} "
+                            f"{leg['strike']:.0f} {leg['expiry']} @ {leg['price']:.2f} "
+                            f"(delta={leg['delta']:.3f}, order_id={leg['order_id']})"
+                        )
+                details_str.append("-" * (len(f"--- Cycle ID: {cycle_id} ---")))
+
+        if not open_cycles_found:
+            return "No live positions currently open."
+        return "\n".join(details_str)
     
     def save_trade_log(self):
         """

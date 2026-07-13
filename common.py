@@ -6,14 +6,33 @@ Includes: expiry date calculations, date validation, trading day checks
 import logging
 import pandas as pd
 from pandas.tseries.offsets import BusinessDay
-from pandas.tseries.holiday import USFederalHolidayCalendar
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar, Holiday, nearest_workday,
+    USMartinLutherKingJr, USPresidentsDay, GoodFriday,
+    USMemorialDay, USLaborDay, USThanksgivingDay
+)
 from datetime import datetime, date
 
 logger = logging.getLogger(__name__)
 
 # ========== HOLIDAY & TRADING DAY UTILITIES ==========
 
-us_holidays = USFederalHolidayCalendar()
+class NYSEHolidayCalendar(AbstractHolidayCalendar):
+    """NYSE/CBOE Trading Calendar for SPX"""
+    rules = [
+        Holiday("New Years Day", month=1, day=1, observance=nearest_workday),
+        USMartinLutherKingJr,
+        USPresidentsDay,
+        GoodFriday,
+        USMemorialDay,
+        Holiday("Juneteenth", month=6, day=19, observance=nearest_workday),
+        Holiday("Independence Day", month=7, day=4, observance=nearest_workday),
+        USLaborDay,
+        USThanksgivingDay,
+        Holiday("Christmas", month=12, day=25, observance=nearest_workday),
+    ]
+
+us_holidays = NYSEHolidayCalendar()
 
 
 def is_trading_day(check_date: pd.Timestamp) -> bool:

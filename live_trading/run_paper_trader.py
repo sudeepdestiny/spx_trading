@@ -52,11 +52,28 @@ def setup_logging():
     logger.info(f"Logging to {log_file}")
 
 
-def is_market_hours():
-    """Check if market is open (9:30 AM - 4:00 PM ET)"""
-    now = datetime.now().time()
-    return time(9, 30) <= now <= time(21, 0)  # 9:30 AM - 4:00 PM ET
+import pytz
+from datetime import datetime, time
 
+def get_server_timezone():
+    """Detect the server's timezone."""
+    local_tz = datetime.now().astimezone().tzinfo
+    return local_tz
+
+def is_market_hours():
+    """
+    Check if market is open (9:30 AM - 4:00 PM ET) adjusted for server timezone.
+    """
+    # Define US Eastern Time market hours
+    eastern = pytz.timezone("US/Eastern")
+    market_open = eastern.localize(datetime.combine(datetime.now(eastern).date(), time(9, 30)))
+    market_close = eastern.localize(datetime.combine(datetime.now(eastern).date(), time(16, 0)))
+
+    # Get current US Eastern time
+    now_eastern_time = datetime.now(eastern)
+
+    # Check if current time is within market hours
+    return market_open.time() <= now_eastern_time.time() <= market_close.time()
 
 def run_paper_trader():
     """Main paper trading loop"""
@@ -82,6 +99,7 @@ def run_paper_trader():
         
         # Verify connection
         conn_mgr.print_connection_status()
+
         conn_mgr.ensure_connected()
         
         info = conn_mgr.get_connection_info()
@@ -100,12 +118,10 @@ def run_paper_trader():
         
         while True:
             try:
-                # Check market hours
-                # if not is_market_hours():
-                #     logger.debug(f"Market closed ({datetime.now().strftime('%H:%M:%S')}). Waiting...")
-                #     time_module.sleep(60)
-                #     positions_opened_today = False
-                #     continue
+                ######---Check market hours
+                if not is_market_hours():
+                    logger.info(f"Market closed ({datetime.now().strftime('%H:%M:%S')}). Exiting trading session.")
+                    break
                 
                 # Ensure connection is alive
                 if not conn_mgr.is_connected:
@@ -117,7 +133,8 @@ def run_paper_trader():
                         continue
                 
                 # Only open positions once per day
-                if len(trader.live_positions) == 0 and not positions_opened_today:
+                # Check if there are no open positions and we haven't opened yet today
+                if not trader.has_open_positions() and not positions_opened_today:
                     cycle_count += 1
                     logger.info(f"\n[Cycle {cycle_count}] Opening new positions...")
                     
@@ -135,25 +152,44 @@ def run_paper_trader():
                         logger.info(f"✓ Option chain loaded: {len(option_chain)} strikes")
                         
                         # Select and open positions
-                        trader.select_and_open_positions(option_chain)
-                        positions_opened_today = True
-                        last_open_time = pd.Timestamp.now()
-                        
-                        logger.info(f"✓ Positions opened at {last_open_time.strftime('%H:%M:%S')}")
+                        opened_positions = trader.select_and_open_positions(option_chain)
+                        if opened_positions:
+                            positions_opened_today = True
+                            last_open_time = pd.Timestamp.now()
+                            logger.info(f"✓ Positions opened at {last_open_time.strftime('%H:%M:%S')}")
+                        else:
+                            logger.warning("No positions were opened. Will retry in next check.")
                     
                     except Exception as open_error:
                         logger.error(f"Error opening positions: {open_error}", exc_info=True)
                         time_module.sleep(30)
                         continue
                 
-                # Monitor and adjust open positions every 5 minutes
-                if positions_opened_today and len(trader.live_positions) > 0:
-                    logger.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] Monitoring {len(trader.live_positions)} open positions...")
+                # Monitor and adjust any open positions (even if opened in a previous session)
+                if trader.has_open_positions():
+                    logger.info(f"\n[{datetime.now().strftime('%H:%M:%S')}] Monitoring open positions...")
                     
+                    # Log live positions details immediately (even if chain fetch fails)
+                    logger.info("\n--- Current Tracked Positions ---")
+                    logger.info(trader.get_live_positions_details())
+                    logger.info("------------------------------------")
+
                     try:
-                        # Fetch current option chain
+                        # Identify all strikes for currently open positions
+                        required_strikes = trader._get_all_open_strikes()
+
+                        # Extract expiry from the first open cycle so we stay on the same expiry
+                        open_expiry = None
+                        for cycle_data in trader.live_positions.values():
+                            if cycle_data["status"] == "OPEN" and cycle_data["positions"]:
+                                open_expiry = cycle_data["positions"][0]["expiry"]
+                                break
+
+                        # Fetch current option chain using the same expiry as open positions
                         option_chain = trader.get_live_option_chain(
                             underlying="SPX",
+                            required_strikes=required_strikes,
+                            expiry=open_expiry,
                         )
                         
                         if not option_chain.empty:
@@ -163,19 +199,17 @@ def run_paper_trader():
                             # Check each position for expiry
                             for cycle_id, pos_data in list(trader.live_positions.items()):
                                 if pos_data["status"] == "OPEN":
-                                    entry_time = pd.Timestamp(pos_data["entry_time"])
-                                    elapsed_time = (pd.Timestamp.now() - entry_time).total_seconds()
-                                    dte_remaining = elapsed_time / (24 * 3600)
+                                    # Get expiry from the first position (all legs in a cycle share the same expiry)
+                                    expiry_str = pos_data["positions"][0]["expiry"]
+                                    expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
+                                    today = datetime.now().date()
                                     
-                                    logger.info(f"  Cycle {cycle_id}: DTE remaining = {dte_remaining:.2f} days, Status = {pos_data['status']}")
+                                    #logger.info(f"  Cycle {cycle_id}: Expiry = {expiry_str}, Today = {today}, Status = {pos_data['status']}")
                                     
-                                    # Close if past expiry or near end-of-day (3 PM ET)
-                                    close_hour = 15
-                                    current_hour = datetime.now().hour
-                                    
-                                    if current_hour >= close_hour:
-                                        logger.info(f"  Closing cycle {cycle_id} (end of trading day)")
-                                        trader.close_positions_at_expiry(cycle_id, option_chain=option_chain, reason="eod")
+                                    # Close once reaching the expiry day
+                                    if today >= expiry_date:
+                                        logger.info(f"  Closing cycle {cycle_id} (reached expiry day: {expiry_str})")
+                                        trader.close_positions_at_expiry(cycle_id, option_chain=option_chain, reason="expiry")
                                         positions_opened_today = False
                         else:
                             logger.warning("Could not fetch option chain for monitoring")

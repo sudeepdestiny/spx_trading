@@ -37,7 +37,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
+# lofgging.getLogger('IBKRConnectionManager').setLevel(logging.WARNING)
 
 class ConnectionWrapper(EWrapper):
     """Minimal wrapper for connection status"""
@@ -53,6 +53,8 @@ class ConnectionWrapper(EWrapper):
         self.errors = []
         self.hist_data = []
         self.done_event = threading.Event()
+        self.positions_data = []
+        self.positions_end_event = threading.Event()
 
     def connectAck(self):
         """Called when the API connection is acknowledged."""
@@ -72,10 +74,32 @@ class ConnectionWrapper(EWrapper):
         self.next_valid_order_id = orderId
         logger.info(f"Next Valid Order ID: {orderId}")
     
+    def position(self, account: str, contract, position: float, avgCost: float):
+        """Called for each position held in the account"""
+        self.positions_data.append({
+            "account": account,
+            "symbol": contract.symbol,
+            "secType": contract.secType,
+            "strike": contract.strike,
+            "right": contract.right,
+            "expiry": contract.lastTradeDateOrContractMonth,
+            "position": position,
+            "avgCost": avgCost
+        })
+
+    def positionEnd(self):
+        """Called when all positions have been transmitted"""
+        logger.info("Finished fetching positions from IBKR")
+        self.positions_end_event.set()
+
     def error(self, reqId: int, errorCode: int, errorString: str):
         """Error callback"""
         msg = f"Error {errorCode}: {errorString}"
         self.errors.append((reqId, errorCode, errorString))
+
+        # Completely suppress specific errors that are common or benign
+        if errorCode in (200, 10167, 10090):
+            return
         logger.error(msg)
     
     def connectionClosed(self):
@@ -454,6 +478,28 @@ class IBKRConnectionManager:
         if not self.is_connected:
             return self.connect(timeout=timeout)
         return True
+
+    def get_all_positions(self, timeout: int = 5) -> list:
+        """
+        Fetch all current positions from the connected IBKR account
+        """
+        if not self.is_connected:
+            logger.error("Cannot fetch positions: Not connected")
+            return []
+
+        self.wrapper.positions_data = []
+        self.wrapper.positions_end_event.clear()
+        
+        logger.info("Requesting all positions from IBKR...")
+        self.client.reqPositions()
+        
+        if not self.wrapper.positions_end_event.wait(timeout=timeout):
+            logger.warning(f"Position fetch timed out after {timeout}s")
+        
+        # Cancel subscription to stop receiving updates (standard IBKR practice)
+        self.client.cancelPositions()
+        
+        return self.wrapper.positions_data
     
     def get_wrapper(self) -> Optional[ConnectionWrapper]:
         """Get wrapper instance (for callbacks)"""

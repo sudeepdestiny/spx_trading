@@ -1,7 +1,7 @@
 STRATEGY_CONFIG = {
     'symbol': '^SPX',
     'sell_delta': 0.15,
-    'pos_delta_thresh': 0.25,
+    'pos_delta_thresh': 0.24,
     'hedge_dist': 150,
     'lot_size': 100,
     'dte_days': 4,  # ← Change to 0 for same-day expiry
