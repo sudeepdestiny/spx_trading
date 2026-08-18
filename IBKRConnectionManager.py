@@ -245,15 +245,18 @@ class IBKRConnectionManager:
         """
         Select paper or live IBKR endpoint before connecting.
         """
-        if self.is_connected:
-            raise RuntimeError("Cannot change IBKR trading mode while connected")
-
         mode = trading_mode
         if mode is None and is_paper is not None:
             mode = "paper" if is_paper else "live"
 
         if mode is None:
             return
+
+        if self.is_connected:
+            current_mode = getattr(self, 'trading_mode', None)
+            if current_mode and current_mode.upper() == mode.upper():
+                return
+            raise RuntimeError("Cannot change IBKR trading mode while connected")
 
         old_mode = getattr(self, "trading_mode", None)
         self._apply_trading_mode(mode)

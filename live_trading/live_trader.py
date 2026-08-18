@@ -3,10 +3,12 @@ import time
 import pandas as pd
 from pathlib import Path
 from datetime import datetime, time as dt_time
-from PaperTrader import PaperTrader
-from ibkr_client import IBKRClient, IBKRWrapper
+from paper_trading import PaperTrader
+from ibkr_client import IBKRClient
 from chain_builder import ChainBuilder
 from config import STRATEGY_CONFIG, LOG_PATH, DATA_PATH, PROCESSED_PATH
+from config import apikey_config
+
 
 def run_live_trading(is_paper: bool = True):
     """Main live/paper trading loop"""
@@ -20,10 +22,15 @@ def run_live_trading(is_paper: bool = True):
     )
     logger = logging.getLogger(__name__)
     logger.info(f"Starting live trading (Paper={is_paper})")
-    
-    # Initialize IBKR connection
-    wrapper = IBKRWrapper()
-    client = IBKRClient(wrapper, is_paper=is_paper)
+
+    mode = apikey_config["ibkr_trading_mode"]
+
+    client = IBKRClient(
+        host=apikey_config[f"ibkr_{mode}_host"],
+        port=apikey_config[f"ibkr_{mode}_port"],
+        client_id=apikey_config[f"ibkr_{mode}_client_id"],
+        is_paper=is_paper
+    )
     client.connect()
     
     # Initialize paper trader
@@ -96,4 +103,4 @@ def run_live_trading(is_paper: bool = True):
 
 if __name__ == "__main__":
     # Run in paper trading mode
-    run_live_trading(is_paper=True)
+    run_live_trading(is_paper=False)
