@@ -4,7 +4,9 @@ import pandas as pd
 import threading
 import time as time_module
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime , time
+from typing import List, Dict, Optional, Tuple
+
 
 logger = logging.getLogger(__name__)
 
@@ -531,8 +533,120 @@ class PaperTrader:
         order.eTradeOnly = False
         order.firmQuoteOnly = False
 
+        # Required for live trading (Error 435 without it).
+        # In live mode, use the explicit account override from config if set.
+        from config import apikey_config
+        if not self.is_paper:
+            account = apikey_config.get("ibkr_live_account") or self.conn_mgr.get_account()
+        else:
+            account = self.conn_mgr.get_account()
+        if account:
+            order.account = account
+
         order_id = self._next_order_id()
         client.placeOrder(order_id, contract, order)
+        return order_id
+    def place_combo_order(self, legs: List[Dict], net_price: float, action: str = "SELL", quantity: int = 1) -> int:
+        """
+        Place a combo (multi-leg) order
+        
+        Args:
+            legs: List of leg dictionaries, each with:
+                - symbol: "SPX"
+                - secType: "OPT"
+                - exchange: "CBOE"
+                - currency: "USD"
+                - strike: float
+                - right: "C" or "P"
+                - expiry: "YYYYMMDD"
+                - action: "BUY" or "SELL"
+                - ratio: int (usually 1)
+            net_price: Net limit price for the combo (positive for credit, negative for debit)
+            action: "BUY" or "SELL" for the combo as a whole
+            quantity: Number of combo units (cycles)
+        
+        Returns:
+            Order ID
+        """
+        from ibapi.contract import Contract, ComboLeg
+        from ibapi.order import Order
+        
+        if not self.is_ready():
+            self.logger.error("IBKR client not ready for orders")
+            return None
+        
+        # Create combo contract (BAG = spread/combo)
+        combo_contract = Contract()
+        combo_contract.symbol = legs[0]["symbol"]  # e.g., "SPX"
+        combo_contract.secType = "BAG"  # BAG = combo/spread
+        combo_contract.exchange = legs[0]["exchange"]
+        combo_contract.currency = legs[0]["currency"]
+        
+        # Build combo legs
+        combo_legs = []
+        for leg in legs:
+            # First, fetch the contract details to get conid
+            leg_contract = Contract()
+            leg_contract.symbol = leg["symbol"]
+            leg_contract.secType = leg["secType"]
+            leg_contract.exchange = leg["exchange"]
+            leg_contract.currency = leg["currency"]
+            leg_contract.strike = leg["strike"]
+            leg_contract.right = leg["right"]
+            leg_contract.lastTradeDateOrContractMonth = leg["expiry"]
+            
+            # Request contract details to get conid
+            req_id = self.next_req_id
+            self.next_req_id += 1
+            self.ib.reqContractDetails(req_id, leg_contract)
+            time.sleep(0.5)  # Wait for response
+            
+            # Extract conid from contract details
+            leg_conid = None
+            with self.market_data_lock:
+                if req_id in self.contract_details:
+                    leg_conid = self.contract_details[req_id].contract.conId
+                    self.logger.info(f"Leg conid: {leg_conid} for {leg['right']} {leg['strike']}")
+            
+            if not leg_conid:
+                self.logger.error(f"Failed to get conid for leg: {leg}")
+                continue
+            
+            # Create combo leg
+            combo_leg = ComboLeg()
+            combo_leg.conId = leg_conid
+            combo_leg.ratio = leg.get("ratio", 1)
+            combo_leg.action = leg["action"]
+            combo_leg.exchange = leg["exchange"]
+            
+            combo_legs.append(combo_leg)
+        
+        combo_contract.comboLegs = combo_legs
+        
+        # Create order
+        order_id = self.next_order_id
+        self.next_order_id += 1
+        
+        order = Order()
+        order.action = action  # "BUY" or "SELL" for the combo
+        order.totalQuantity = quantity
+        order.orderType = "LMT"
+        order.lmtPrice = abs(net_price)  # Net price for the combo
+        order.tif = "DAY"
+        
+        # For combo orders, specify price as positive for credit, negative for debit
+        if action == "SELL" and net_price > 0:
+            # Selling a combo for credit (your typical strangle)
+            order.lmtPrice = net_price
+        elif action == "BUY" and net_price < 0:
+            # Buying a combo for debit (paying)
+            order.lmtPrice = abs(net_price)
+        
+        self.logger.info(f"Placing combo order: {len(combo_legs)} legs, net_price={net_price}, action={action}")
+        
+        # Place the order
+        self.ib.placeOrder(order_id, combo_contract, order)
+    
         return order_id
 
     def _option_price(self, row, option_type, side):
@@ -665,6 +779,20 @@ class PaperTrader:
             ]
 
             positions = []
+            
+            # Calculate net credit (sum of short premiums - long premiums)
+            # This should come from your market data fetch
+            net_credit = 2.50  # Example: $2.50 net credit per cycle
+
+            # Place as single combo order
+            order_id = self.place_combo_order(
+                legs=legs,
+                net_price=net_credit,  # Positive = credit received
+                action="SELL",  # Selling the combo = receiving credit
+                quantity=1  # 1 cycle
+            )
+
+            
             for side, action, option_type, right, row, delta in legs:
                 price = self._option_price(row, option_type, side)
                 if price is None:
@@ -692,12 +820,39 @@ class PaperTrader:
                 logger.warning(f"No positions selected for cycle {self.cycle_id}")
                 return []
             
-            for pos in positions:
-                logger.info(f"  Opening: {pos['action']} {pos['quantity']} {pos['type']} {pos['strike']:.0f} {pos['expiry']} @ {pos['price']:.2f} (delta={pos['delta']:.3f})")
+            hedge_orders = [p for p in positions if p["action"] == "BUY"]
+            short_orders = [p for p in positions if p["action"] == "SELL"]
+            
+            # Step 1: Place and confirm hedges (long legs) first
+            hedge_ids = []
+            for pos in hedge_orders:
+                logger.info(f"  Opening HEDGE: {pos['action']} {pos['quantity']} {pos['type']} {pos['strike']:.0f} {pos['expiry']} @ {pos['price']:.2f} (delta={pos['delta']:.3f})")
                 if submit_orders:
-                    pos["order_id"] = self._place_option_order(pos, quantity)
+                    oid = self._place_option_order(pos, quantity)
+                    pos["order_id"] = oid
                     pos["status"] = "SUBMITTED"
-                    logger.info(f"    Submitted IBKR order_id={pos['order_id']}")
+                    logger.info(f"    Submitted IBKR order_id={oid}")
+                    
+                    filled = self.conn_mgr.wait_for_fill(oid, timeout=10.0)
+                    if not filled:
+                        logger.error(f"Hedge leg {oid} did not fill — aborting cycle, cancelling all")
+                        for h in hedge_ids:
+                            self.conn_mgr.cancel_order(h)
+                        return []
+                    hedge_ids.append(oid)
+                    pos["status"] = "FILLED"
+                    
+            # Step 2: Only place shorts after hedges are confirmed filled
+            for pos in short_orders:
+                logger.info(f"  Opening SHORT: {pos['action']} {pos['quantity']} {pos['type']} {pos['strike']:.0f} {pos['expiry']} @ {pos['price']:.2f} (delta={pos['delta']:.3f})")
+                if submit_orders:
+                    oid = self._place_option_order(pos, quantity)
+                    pos["order_id"] = oid
+                    pos["status"] = "SUBMITTED"
+                    logger.info(f"    Submitted IBKR order_id={oid}")
+                    
+                    self.conn_mgr.wait_for_fill(oid, timeout=10.0)
+                    pos["status"] = "FILLED"
 
             self.live_positions[self.cycle_id] = {
                 "cycle_id": self.cycle_id,
@@ -764,11 +919,12 @@ class PaperTrader:
 
         return total_delta
 
-    def _find_open_short(self, positions, option_type):
+    def _find_open_short(self, positions, option_type,side="S"):
         for pos in positions:
-            if pos.get("status") != "CLOSED" and pos["side"] == "S" and pos["type"] == option_type:
+            if pos.get("status") != "CLOSED" and pos["side"] == side and pos["type"] == option_type:
                 return pos
         return None
+
 
     def _find_open_hedge(self, positions, short_pos, hedge_dist):
         hedge_strike = short_pos["strike"] + hedge_dist if short_pos["type"] == "CE" else short_pos["strike"] - hedge_dist
@@ -919,10 +1075,11 @@ class PaperTrader:
 
                 short_type = "CE" if current_delta > 0 else "PE"
                 short_pos = self._find_open_short(pos_data["positions"], short_type)
+                other_type = "PE" if short_type == "CE" else "CE"
                 if short_pos is None:
                     # Only warn if there is actually a short on the other side (suggesting a strangle)
                     # This avoids noise for single-leg cycles reconstructed from IBKR
-                    other_type = "PE" if short_type == "CE" else "CE"
+                    
                     if self._find_open_short(pos_data["positions"], other_type):
                         logger.warning(f"  Cycle {cycle_id}: no open {short_type} short to adjust (current_delta={current_delta:.4f})")
                         
@@ -930,7 +1087,7 @@ class PaperTrader:
                     continue
 
                 hedge_dist = pos_data.get("hedge_dist", self.strategy.config.get("hedge_dist", 150))
-                hedge_pos = self._find_open_hedge(pos_data["positions"], short_pos, hedge_dist)
+                hedge_pos = self._find_open_short(pos_data["positions"], short_type,side="B")
                 if hedge_pos is None:
                     logger.warning(f"  Cycle {cycle_id}: no matching {short_type} hedge for strike {short_pos['strike']:.0f}")
                     results[cycle_id] = {"status": "missing_hedge", "current_delta": current_delta}
@@ -977,8 +1134,9 @@ class PaperTrader:
                     results[cycle_id] = {"status": "open_replacement_failed", "current_delta": current_delta}
                     continue
 
-                self._submit_new_position(replacement_short)
                 self._submit_new_position(replacement_hedge)
+                self._submit_new_position(replacement_short)
+                
                 pos_data["positions"].extend([replacement_short, replacement_hedge])
                 pos_data["adjustments"] = adjustments + 1
 

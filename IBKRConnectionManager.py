@@ -55,6 +55,18 @@ class ConnectionWrapper(EWrapper):
         self.done_event = threading.Event()
         self.positions_data = []
         self.positions_end_event = threading.Event()
+        self.account_summary_data = {}
+        self.account_summary_end_event = threading.Event()
+        self.filled_orders = {}
+        
+        
+        self.what_if_order_states = {}
+        self.what_if_events = {}
+        self.next_valid_order_id = None
+        self.contract_details = {}
+
+
+        
 
     def connectAck(self):
         """Called when the API connection is acknowledged."""
@@ -91,6 +103,23 @@ class ConnectionWrapper(EWrapper):
         """Called when all positions have been transmitted"""
         logger.info("Finished fetching positions from IBKR")
         self.positions_end_event.set()
+
+    def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str):
+        """Called for account summary data"""
+        self.account_summary_data[tag] = value
+
+    def accountSummaryEnd(self, reqId: int):
+        """Called when account summary is complete"""
+        self.account_summary_end_event.set()
+
+    def orderStatus(self, orderId: int, status: str, filled: float, remaining: float, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
+        """Order status callback"""
+        self.filled_orders[orderId] = {
+            "status": status,
+            "filled": filled,
+            "avg_price": avgFillPrice
+        }
+        logger.info(f"Order {orderId} status={status} filled={filled} avgPrice={avgFillPrice}")
 
     def error(self, reqId: int, errorCode: int, errorString: str):
         """Error callback"""
@@ -209,6 +238,7 @@ class IBKRConnectionManager:
         self.is_connected = False
         self.connect_lock = threading.Lock()
         self.current_client_id = self.primary_client_id
+        self._next_req_id_counter = 10000
         
         logger.info(f"IBKRConnectionManager initialized")
         logger.info(f"  OS: {system}")
@@ -338,14 +368,11 @@ class IBKRConnectionManager:
             
             logger.info(f"Waiting for connection confirmation (timeout={timeout}s)...")
             
-            # Wait for managedAccounts (preferred), but accept connectAck+isConnected as success too.
+            # Wait for managedAccounts and nextValidId to ensure API is fully ready
             deadline = time.time() + timeout
             connected = False
             while time.time() < deadline:
-                if self.wrapper.connection_event.is_set():
-                    connected = True
-                    break
-                if self.wrapper.connect_ack_event.is_set() and self.client.isConnected():
+                if self.wrapper.connection_event.is_set() and self.wrapper.next_valid_order_id is not None:
                     connected = True
                     break
                 time.sleep(0.05)
@@ -503,6 +530,51 @@ class IBKRConnectionManager:
         self.client.cancelPositions()
         
         return self.wrapper.positions_data
+
+    def get_margin_summary(self, timeout: int = 5) -> dict:
+        """Fetch account margin and available funds from IBKR"""
+        if not self.is_connected:
+            logger.error("IBKR connection not ready")
+            return {}
+
+        self.wrapper.account_summary_data = {}
+        self.wrapper.account_summary_end_event.clear()
+
+        req_id = self._next_req_id_counter
+        self._next_req_id_counter += 1
+
+        logger.info("Requesting account margin summary...")
+        self.client.reqAccountSummary(
+            req_id,
+            "All",
+            "InitMarginReq,MaintMarginReq,AvailableFunds,ExcessLiquidity,NetLiquidation"
+        )
+
+        received = self.wrapper.account_summary_end_event.wait(timeout=timeout)
+        if not received:
+            logger.warning("Account summary timed out")
+
+        self.client.cancelAccountSummary(req_id)
+
+        summary = dict(self.wrapper.account_summary_data)
+        logger.info(f"Margin summary: {summary}")
+        return summary
+        
+    def wait_for_fill(self, order_id: int, timeout: float = 10.0) -> bool:
+        """Block until order is Filled or timeout expires."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.wrapper.filled_orders.get(order_id, {}).get("status", "")
+            if status == "Filled":
+                return True
+            time.sleep(0.2)
+        logger.warning(f"Order {order_id} did not fill within {timeout}s")
+        return False
+    
+    def cancel_order(self, order_id: int):
+        if self.is_connected:
+            self.client.cancelOrder(order_id)
+            logger.info(f"Cancelled order {order_id}")
     
     def get_wrapper(self) -> Optional[ConnectionWrapper]:
         """Get wrapper instance (for callbacks)"""
@@ -605,3 +677,38 @@ def get_ibkr_connection(is_paper: bool = None, trading_mode: str = None) -> IBKR
     conn_mgr = IBKRConnectionManager.get_instance()
     conn_mgr.set_trading_mode(trading_mode=trading_mode, is_paper=is_paper)
     return conn_mgr
+
+#Combo legs require each option contract’s  conId .
+def resolve_option_conid(self, leg: dict, timeout: float = 5.0):
+    """Resolve an option leg to its IBKR contract ID."""
+    from ibapi.contract import Contract
+
+    req_id = self._next_req_id_counter
+    self._next_req_id_counter += 1
+
+    contract = Contract()
+    contract.symbol = leg["symbol"]
+    contract.secType = "OPT"
+    contract.exchange = leg.get("exchange", "CBOE")
+    contract.currency = leg.get("currency", "USD")
+    contract.lastTradeDateOrContractMonth = leg["expiry"]
+    contract.strike = float(leg["strike"])
+    contract.right = leg["right"]
+    contract.multiplier = str(leg.get("multiplier", "100"))
+
+    self.wrapper.contract_details[req_id] = None
+    self.client.reqContractDetails(req_id, contract)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        details = self.wrapper.contract_details.get(req_id)
+        if details:
+            return details.contract.conId
+        time.sleep(0.05)
+
+    raise TimeoutError(f"Could not resolve contract ID for leg: {leg}")
+
+def contractDetails(self, reqId, contractDetails):
+    self.contract_details[reqId] = contractDetails
+
+

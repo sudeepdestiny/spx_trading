@@ -4,11 +4,24 @@ import threading
 import time
 from typing import Dict, List, Optional
 from queue import Queue
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from config import apikey_config
+
+mode = apikey_config.get("ibkr_trading_mode", "paper")
+
 
 class IBKRClient:
     """Wrapper for Interactive Brokers API (TWS/Gateway)"""
     
-    def __init__(self, host: str = "127.0.0.1", port: int = 7497, client_id: int = 4, is_paper: bool = True):
+    def __init__(
+        self,
+        host: str = apikey_config.get("ibkr_paper_host", "127.0.0.1"),
+        port: int = apikey_config.get(f"ibkr_{mode}_port", 7497),
+        client_id: int = apikey_config.get(f"ibkr_{mode}_client_id", 1),
+        is_paper: bool = (mode == "paper")
+    ):
         self.host = host
         self.port = port
         self.client_id = client_id
@@ -22,6 +35,10 @@ class IBKRClient:
         self.market_data_lock = threading.Lock()
         self.connection_event = threading.Event()  # Signal when connected
         self.is_connected = False
+        self.account_data = {}
+        self.account_data_lock = threading.Lock()
+        self.account_data_event = threading.Event()
+        self.filled_orders = {}
     
     def connect(self):
         """Connect to TWS/Gateway and wait for handshake"""
@@ -33,6 +50,18 @@ class IBKRClient:
             class IBWrapper(EWrapper):
                 def __init__(self, client):
                     self.client = client
+                    self.filled_orders = {}
+                
+                def orderStatus(self, orderId, status, filled, remaining, avgFillPrice, 
+                                permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
+                    self.client.filled_orders[orderId] = {
+                        "status": status,
+                        "filled": filled,
+                        "avg_price": avgFillPrice
+                    }
+                    self.client.logger.info(
+                        f"Order {orderId} status={status} filled={filled} avgPrice={avgFillPrice}"
+                    )
                 
                 def nextValidId(self, orderId: int):
                     """Called when connection is ready"""
@@ -58,6 +87,14 @@ class IBKRClient:
                 def contractDetailsEnd(self, reqId: int):
                     """End of contract details stream"""
                     self.client.logger.info(f"Contract details complete for reqId {reqId}")
+                
+                def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str):
+                    with self.client.account_data_lock:
+                        self.client.account_data[tag] = value
+                    self.client.logger.info(f"Account {tag}: {value} {currency}")
+
+                def accountSummaryEnd(self, reqId: int):
+                    self.client.account_data_event.set()  # Signal data complete
                 
                 def error(self, reqId: int, errorCode: int, errorString: str):
                     self.client.logger.error(f"Error {errorCode} (reqId {reqId}): {errorString}")
@@ -85,6 +122,10 @@ class IBKRClient:
                     "Make sure TWS or Gateway is running and listening on this port."
                 )
             
+            data_type = 3 if self.is_paper else 1
+            self.ib.reqMarketDataType(data_type)
+            self.logger.info(f"Market data type set to {data_type} ({'delayed' if self.is_paper else 'live'})")
+            
             self.logger.info(f"✓ Connected to IBKR TWS at {self.host}:{self.port}")
         
         except ImportError as e:
@@ -109,6 +150,63 @@ class IBKRClient:
             self.ib.disconnect()
             self.is_connected = False
             self.logger.info("Disconnected from IBKR")
+            
+    def get_margin_summary(self, timeout: int = 5) -> dict:
+        """Fetch account margin and available funds from IBKR"""
+        if not self.is_ready():
+            self.logger.error("IBKR client not ready")
+            return {}
+
+        self.account_data_event.clear()
+
+        self.ib.reqAccountSummary(
+            9001,   # reqId — fixed, not reused
+            "All",
+            "InitMarginReq,MaintMarginReq,AvailableFunds,ExcessLiquidity,NetLiquidation"
+        )
+
+        received = self.account_data_event.wait(timeout=timeout)
+        if not received:
+            self.logger.warning("Account summary timed out")
+
+        self.ib.cancelAccountSummary(9001)
+
+        with self.account_data_lock:
+            summary = dict(self.account_data)
+
+        self.logger.info(f"Margin summary: {summary}")
+        return summary
+        
+    def wait_for_fill(self, order_id: int, timeout: float = 10.0) -> bool:
+        """Block until order is Filled or timeout expires."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            status = self.filled_orders.get(order_id, {}).get("status", "")
+            if status == "Filled":
+                return True
+            time.sleep(0.2)
+        self.logger.warning(f"Order {order_id} did not fill within {timeout}s")
+        return False
+        
+    def place_orders_sequenced(self, orders: list, delay_secs: float = 0.5) -> list:
+        """
+        Place a list of orders with BUY legs executed before SELL legs.
+        Returns list of order IDs in execution order.
+        """
+        # Sort: BUY first, SELL second
+        sorted_orders = sorted(orders, key=lambda o: 0 if o["action"] == "BUY" else 1)
+        
+        order_ids = []
+        for order_dict in sorted_orders:
+            order_id = self.place_order(order_dict)
+            order_ids.append(order_id)
+            self.logger.info(
+                f"Placed {order_dict['action']} order {order_id} "
+                f"({order_dict['contract']['right']} @ {order_dict['contract']['strike']})"
+            )
+            time.sleep(delay_secs)  # small gap so IBKR processes each leg
+        
+        return order_ids
     
     def get_option_chain(self, symbol: str = "SPX", expiry: str = None, strike_range: tuple = None) -> pd.DataFrame:
         """
