@@ -122,7 +122,7 @@ class IBKRClient:
                     "Make sure TWS or Gateway is running and listening on this port."
                 )
             
-            data_type = 3 if self.is_paper else 1
+            data_type = 1 if self.is_paper else 1
             self.ib.reqMarketDataType(data_type)
             self.logger.info(f"Market data type set to {data_type} ({'delayed' if self.is_paper else 'live'})")
             

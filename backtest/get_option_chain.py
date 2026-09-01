@@ -7,7 +7,7 @@ nest_asyncio.apply()
 ib = IB()
 try:
     ib.connect('127.0.0.1', 7497, clientId=3)
-    ib.reqMarketDataType(3)
+    ib.reqMarketDataType(1)
 
     spx = Index('SPX', 'CBOE')
     ib.qualifyContracts(spx)
