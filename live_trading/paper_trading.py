@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "backtest"))
 
 from strategy import DeltaNeutralStrategy
+from config import US_MARKET_HOLIDAYS
 
 
 class PaperTrader:
@@ -299,10 +300,15 @@ class PaperTrader:
                 logger.info(f"Using explicit expiry override: {expiry}")
             else:
                 expiry_ts = now_et.normalize() + pd.Timedelta(days=dte_days, hours=16)
-                while expiry_ts.weekday() >= 5:
+                while (
+                    expiry_ts.weekday() >= 5 or  # Weekend (Saturday=5, Sunday=6)
+                    expiry_ts.strftime("%Y%m%d") in US_MARKET_HOLIDAYS  # Holiday from config
+                ):
                     expiry_ts += pd.Timedelta(days=1)
                 if expiry_ts.strftime("%Y%m%d") == "20260525":
                     expiry_ts += pd.Timedelta(days=1)
+            
+            expiry = expiry_ts.strftime("%Y%m%d")
             
             expiry = expiry_ts.strftime("%Y%m%d")
             effective_dte_days = max((expiry_ts - now_et).total_seconds() / 86400, 1 / 365)

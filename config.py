@@ -1,8 +1,8 @@
 STRATEGY_CONFIG = {
     'symbol': '^SPX',
     'sell_delta': 0.15,
-    'pos_delta_thresh': 0.24,
-    'hedge_dist': 150,
+    'pos_delta_thresh': 0.25,
+    'hedge_dist': 80,
     'lot_size': 100,
     'dte_days': 4,  # ← Change to 0 for same-day expiry
     'start_date': '2026-03-02',
@@ -57,6 +57,7 @@ if system == "Linux":
     apikey_config["ibkr_live_port"] = 4001
     apikey_config["ibkr_paper_client_id"] = 1
     apikey_config["ibkr_live_client_id"] = 2
+    apikey_config["ibkr_live_account"] = "U24990147"  # Override account for live orders
 elif system == "Windows":
     apikey_config["ibkr_paper_host"] = "127.0.0.1"
     apikey_config["ibkr_live_host"] = "127.0.0.1"
@@ -64,12 +65,43 @@ elif system == "Windows":
     apikey_config["ibkr_live_port"] = 7496
     apikey_config["ibkr_paper_client_id"] = 1
     apikey_config["ibkr_live_client_id"] = 2
+    apikey_config["ibkr_live_account"] = "U24990147"  # Override account for live orders
 elif system == "Darwin":
     apikey_config["ibkr_paper_host"] = "127.0.0.1"
     apikey_config["ibkr_live_host"] = "127.0.0.1"
     apikey_config["ibkr_paper_port"] = 7497
     apikey_config["ibkr_live_port"] = 7496
-    apikey_config["ibkr_paper_client_id"] = 3
-    apikey_config["ibkr_live_client_id"] = 4
+    apikey_config["ibkr_paper_client_id"] = 1
+    apikey_config["ibkr_live_client_id"] = 2
+    apikey_config["ibkr_live_account"] = "U24990147"  # Override account for live orders
 
-apikey_config["ibkr_trading_mode"] = os.getenv("IBKR_TRADING_MODE", "paper").lower()
+apikey_config["ibkr_trading_mode"] = os.getenv("IBKR_TRADING_MODE", "live").lower()
+
+
+# US Market Holidays 2026
+# Source: NYSE/IBKR market holiday calendar
+US_MARKET_HOLIDAYS_2026 = {
+    "20260101",  # New Year's Day
+    "20260119",  # Martin Luther King Jr. Day
+    "20260216",  # Presidents' Day
+    "20260525",  # Memorial Day
+    "20260703",  # Independence Day (observed)
+    "20260907",  # Labor Day
+    "20261126",  # Thanksgiving
+    "20261225",  # Christmas
+}
+
+# US Market Holidays 2027 (for forward planning)
+US_MARKET_HOLIDAYS_2027 = {
+    "20270101",  # New Year's Day
+    "20270118",  # Martin Luther King Jr. Day
+    "20270215",  # Presidents' Day
+    "20270531",  # Memorial Day
+    "20270705",  # Independence Day (observed)
+    "20270906",  # Labor Day
+    "20271125",  # Thanksgiving
+    "20271224",  # Christmas (observed)
+}
+
+# Combined holiday set
+US_MARKET_HOLIDAYS = US_MARKET_HOLIDAYS_2026 | US_MARKET_HOLIDAYS_2027
