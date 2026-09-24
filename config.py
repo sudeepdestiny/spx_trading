@@ -29,7 +29,7 @@ system = platform.system()
 if system == "Windows":
     ROOT = Path("E:/Study/trading 2025/Trading2025")
 elif system == "Linux":
-    ROOT = Path("/home/opc/spx_trading")
+    ROOT = Path("/home/opc/dev/spx_trading")
 elif system == "Darwin":
     ROOT = Path("/Users/sudeepdas/Documents/Study/spx_trading")
 else:
