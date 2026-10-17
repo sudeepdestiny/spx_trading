@@ -15,17 +15,16 @@ import socket
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple
 
 try:
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
-    from ibapi.contract import Contract, ComboLeg
-    from ibapi.order import Order
 except ImportError:
     raise ImportError("ibapi not installed. Install with: pip install ibapi")
 
 from config import apikey_config, LOG_PATH
+
 
 # Setup logging
 log_dir = Path(LOG_PATH)
@@ -41,9 +40,8 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
-
+# lofgging.getLogger('IBKRConnectionManager').setLevel(logging.WARNING)
 
 class ConnectionWrapper(EWrapper):
     """Minimal wrapper for connection status"""
@@ -64,10 +62,7 @@ class ConnectionWrapper(EWrapper):
         self.account_summary_data = {}
         self.account_summary_end_event = threading.Event()
         self.filled_orders = {}
-        self.contract_details = {}  # For resolving conId
-        self.what_if_order_states = {}  # For margin checks
-        self.what_if_events = {}  # Events for WhatIf responses
-    
+
     def connectAck(self):
         """Called when the API connection is acknowledged."""
         self.connect_ack_event.set()
@@ -98,20 +93,20 @@ class ConnectionWrapper(EWrapper):
             "position": position,
             "avgCost": avgCost
         })
-    
+
     def positionEnd(self):
         """Called when all positions have been transmitted"""
         logger.info("Finished fetching positions from IBKR")
         self.positions_end_event.set()
-    
+
     def accountSummary(self, reqId: int, account: str, tag: str, value: str, currency: str):
         """Called for account summary data"""
         self.account_summary_data[tag] = value
-    
+
     def accountSummaryEnd(self, reqId: int):
         """Called when account summary is complete"""
         self.account_summary_end_event.set()
-    
+
     def orderStatus(self, orderId: int, status: str, filled: float, remaining: float, avgFillPrice: float, permId: int, parentId: int, lastFillPrice: float, clientId: int, whyHeld: str, mktCapPrice: float):
         """Order status callback"""
         self.filled_orders[orderId] = {
@@ -148,7 +143,7 @@ class ConnectionWrapper(EWrapper):
         """Error callback"""
         msg = f"Error {errorCode}: {errorString}"
         self.errors.append((reqId, errorCode, errorString))
-        
+
         # Completely suppress specific errors that are common or benign
         if errorCode in (200, 10167, 10090):
             return
@@ -189,7 +184,6 @@ class IBKRConnectionManager:
     - Exponential backoff between retries
     - Thread-safe singleton pattern
     - OS-aware host/port selection
-    - WhatIf combo margin checking
     
     Use: IBKRConnectionManager.get_instance()
     """
@@ -227,7 +221,7 @@ class IBKRConnectionManager:
         else:
             default_paper_port = 7497
             default_live_port = 7496
-        
+
         def _env_int(name: str) -> Optional[int]:
             val = os.getenv(name)
             if val is None or val == "":
@@ -237,19 +231,19 @@ class IBKRConnectionManager:
             except ValueError:
                 logger.warning(f"Ignoring invalid int env var {name}={val!r}")
                 return None
-        
+
         base_host = os.getenv("IBKR_HOST") or apikey_config.get("ibkr_host") or "127.0.0.1"
         self.paper_host = os.getenv("IBKR_PAPER_HOST") or apikey_config.get("ibkr_paper_host") or base_host
         self.live_host = os.getenv("IBKR_LIVE_HOST") or apikey_config.get("ibkr_live_host") or base_host
-        
+
         base_port = _env_int("IBKR_PORT") or apikey_config.get("ibkr_port")
         self.paper_port = _env_int("IBKR_PAPER_PORT") or apikey_config.get("ibkr_paper_port") or base_port or default_paper_port
         self.live_port = _env_int("IBKR_LIVE_PORT") or apikey_config.get("ibkr_live_port") or base_port or default_live_port
-        
+
         base_client_id = _env_int("IBKR_CLIENT_ID") or apikey_config.get("ibkr_client_id")
         self.paper_client_id = _env_int("IBKR_PAPER_CLIENT_ID") or apikey_config.get("ibkr_paper_client_id") or base_client_id or 1
         self.live_client_id = _env_int("IBKR_LIVE_CLIENT_ID") or apikey_config.get("ibkr_live_client_id") or base_client_id or 2
-        
+
         self.trading_mode = (os.getenv("IBKR_TRADING_MODE") or apikey_config.get("ibkr_trading_mode") or "paper").lower()
         self._apply_trading_mode(self.trading_mode)
         
@@ -277,12 +271,12 @@ class IBKRConnectionManager:
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
-    
+
     def _apply_trading_mode(self, trading_mode: str):
         mode = (trading_mode or "paper").lower()
         if mode not in ("paper", "live"):
             raise ValueError(f"Unsupported IBKR trading mode: {trading_mode}")
-        
+
         self.trading_mode = mode
         if mode == "live":
             self.host = self.live_host
@@ -292,9 +286,9 @@ class IBKRConnectionManager:
             self.host = self.paper_host
             self.port = self.paper_port
             self.primary_client_id = self.paper_client_id
-        
+
         self.current_client_id = self.primary_client_id
-    
+
     def set_trading_mode(self, trading_mode: str = None, is_paper: bool = None):
         """
         Select paper or live IBKR endpoint before connecting.
@@ -302,29 +296,29 @@ class IBKRConnectionManager:
         mode = trading_mode
         if mode is None and is_paper is not None:
             mode = "paper" if is_paper else "live"
-        
+
         if mode is None:
             return
-        
+
         if self.is_connected:
             current_mode = getattr(self, 'trading_mode', None)
             if current_mode and current_mode.upper() == mode.upper():
                 return
             raise RuntimeError("Cannot change IBKR trading mode while connected")
-        
+
         old_mode = getattr(self, "trading_mode", None)
         self._apply_trading_mode(mode)
-        
+
         if old_mode != self.trading_mode:
             logger.info(
                 f"IBKR trading mode set to {self.trading_mode.upper()} "
                 f"({self.host}:{self.port}, client_id={self.primary_client_id})"
             )
-    
+
     def _tcp_probe(self, host: str, port: int, timeout: float = 2.0) -> Tuple[bool, str]:
         """
         Lightweight TCP reachability check for host:port.
-        
+
         Returns:
             (ok, message)
         """
@@ -338,7 +332,7 @@ class IBKRConnectionManager:
             if err is not None:
                 return False, f"TCP check FAILED: {host}:{port} ({e.strerror}, errno={err})"
             return False, f"TCP check FAILED: {host}:{port} ({e})"
-    
+
     def _log_endpoint_hints(self):
         mode = self.trading_mode.upper()
         logger.error("IBKR API endpoint appears unreachable.")
@@ -348,7 +342,7 @@ class IBKRConnectionManager:
         logger.error("  TWS:       paper=7497, live=7496")
         logger.error("Overrides supported via env vars: IBKR_PAPER_HOST/PORT, IBKR_LIVE_HOST/PORT, IBKR_TRADING_MODE.")
         logger.error("If TWS/IB Gateway runs on another machine, set the host accordingly or use an SSH tunnel.")
-    
+
     def _log_api_settings_hints(self):
         logger.error("If the port is reachable but IB API still won't connect, check in TWS/IB Gateway:")
         logger.error("  - API enabled (Enable ActiveX and Socket Clients)")
@@ -375,6 +369,7 @@ class IBKRConnectionManager:
             self.client = EClient(self.wrapper)
             
             # Attempt connection
+            # Note: ibapi's EClient.connect() does not return a success boolean (returns None).
             self.client.connect(self.host, self.port, client_id)
             if not self.client.isConnected():
                 logger.warning(
@@ -448,7 +443,7 @@ class IBKRConnectionManager:
             logger.info(f"Connecting to IBKR at {self.host}:{self.port}")
             logger.info(f"Max retries: {max_retries}")
             logger.info("=" * 70)
-            
+
             ok, probe_msg = self._tcp_probe(self.host, self.port, timeout=min(2.0, max(0.5, timeout / 10)))
             if ok:
                 logger.info(probe_msg)
@@ -531,7 +526,7 @@ class IBKRConnectionManager:
         if not self.is_connected:
             return self.connect(timeout=timeout)
         return True
-    
+
     def get_all_positions(self, timeout: int = 5) -> list:
         """
         Fetch all current positions from the connected IBKR account
@@ -539,7 +534,7 @@ class IBKRConnectionManager:
         if not self.is_connected:
             logger.error("Cannot fetch positions: Not connected")
             return []
-        
+
         self.wrapper.positions_data = []
         self.wrapper.positions_end_event.clear()
         
@@ -553,32 +548,32 @@ class IBKRConnectionManager:
         self.client.cancelPositions()
         
         return self.wrapper.positions_data
-    
+
     def get_margin_summary(self, timeout: int = 5) -> dict:
         """Fetch account margin and available funds from IBKR"""
         if not self.is_connected:
             logger.error("IBKR connection not ready")
             return {}
-        
+
         self.wrapper.account_summary_data = {}
         self.wrapper.account_summary_end_event.clear()
-        
+
         req_id = self._next_req_id_counter
         self._next_req_id_counter += 1
-        
+
         logger.info("Requesting account margin summary...")
         self.client.reqAccountSummary(
             req_id,
             "All",
             "InitMarginReq,MaintMarginReq,AvailableFunds,ExcessLiquidity,NetLiquidation"
         )
-        
+
         received = self.wrapper.account_summary_end_event.wait(timeout=timeout)
         if not received:
             logger.warning("Account summary timed out")
-        
+
         self.client.cancelAccountSummary(req_id)
-        
+
         summary = dict(self.wrapper.account_summary_data)
         logger.info(f"Margin summary: {summary}")
         return summary

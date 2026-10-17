@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from IBKRConnectionManager import get_ibkr_connection
 from paper_trading import PaperTrader
-from config import LOG_PATH
+from config import LOG_PATH, US_MARKET_HOLIDAYS
 
 # Setup logging
 LOG_PATH = Path(LOG_PATH)
@@ -56,9 +56,18 @@ def is_market_hours():
     eastern = pytz.timezone("US/Eastern")
     market_open = eastern.localize(datetime.combine(datetime.now(eastern).date(), time(9, 30)))
     market_close = eastern.localize(datetime.combine(datetime.now(eastern).date(), time(16, 0)))
+    
+    
 
     # Get current US Eastern time
     now_eastern_time = datetime.now(eastern)
+    today_str = now_eastern_time.strftime("%Y%m%d")
+    
+    # Check if today is a holiday
+    if today_str in US_MARKET_HOLIDAYS:
+        logger.info(f"Market closed: {today_str} is a US market holiday")
+        return False
+
 
     # Check if current time is within market hours
     return market_open.time() <= now_eastern_time.time() <= market_close.time()
