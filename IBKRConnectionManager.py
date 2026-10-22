@@ -15,11 +15,14 @@ import socket
 import os
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
+import math
 
 try:
     from ibapi.client import EClient
     from ibapi.wrapper import EWrapper
+    from ibapi.contract import Contract, ComboLeg
+    from ibapi.order import Order
 except ImportError:
     raise ImportError("ibapi not installed. Install with: pip install ibapi")
 
@@ -62,6 +65,13 @@ class ConnectionWrapper(EWrapper):
         self.account_summary_data = {}
         self.account_summary_end_event = threading.Event()
         self.filled_orders = {}
+        self.margin_lock = threading.RLock()
+        self.order_id_lock = threading.Lock()
+        self.what_if_order_states = {}
+        self.what_if_events = {}
+        self.contract_details = {}
+        self.contract_details_events = {}
+        self.request_errors = {}
 
     def connectAck(self):
         """Called when the API connection is acknowledged."""
@@ -116,38 +126,83 @@ class ConnectionWrapper(EWrapper):
         }
         logger.info(f"Order {orderId} status={status} filled={filled} avgPrice={avgFillPrice}")
     
-    def openOrder(self, orderId: int, contract: Contract, order: Order, orderState):
-        """
-        Called when an order is opened.
-        For WhatIf orders, this provides margin information.
-        """
-        if order.whatIf:
-            self.what_if_order_states[orderId] = orderState
+    def openOrder(self, orderId, contract, order, orderState):
+        
+        # Log before any filter or early return.
+        logger.info(
+            "openOrder received: wrapper=%s orderId=%s "
+            "whatIf=%r status=%r initMarginAfter=%r "
+            "warning=%r",
+            id(self),
+            orderId,
+            getattr(order, "whatIf", None),
+            getattr(orderState, "status", None),
+            getattr(orderState, "initMarginAfter", None),
+            getattr(orderState, "warningText", None),
+        )
+
+        with self.margin_lock:
             event = self.what_if_events.get(orderId)
+
+            logger.info(
+                "openOrder matching: orderId=%s event_found=%s "
+                "pending_ids=%s",
+                orderId,
+                event is not None,
+                list(self.what_if_events),
+            )
+
+            # Match requests explicitly registered as previews.
+            if event is None:
+                return
+
+            if not getattr(order, "whatIf", False):
+                self.request_errors[orderId] = (
+                    "Received an unexpected non-what-if response "
+                    "for a registered margin-preview request"
+                )
+            else:
+                self.what_if_order_states[orderId] = orderState
+
+        event.set()
+
+    
+    def contractDetails(self, reqId, contractDetails):
+        with self.margin_lock:
+            if reqId in self.contract_details:
+                self.contract_details[reqId].append(contractDetails)
+
+    def contractDetailsEnd(self, reqId):
+        with self.margin_lock:
+            event = self.contract_details_events.get(reqId)
             if event:
                 event.set()
-            logger.info(
-                f"WhatIf order {orderId}: initMarginChange={getattr(orderState, 'initMarginChange', None)}, "
-                f"maintMarginChange={getattr(orderState, 'maintMarginChange', None)}"
-            )
     
-    def contractDetails(self, reqId: int, contractDetails):
-        """Store contract details for conId resolution"""
-        self.contract_details[reqId] = contractDetails
-    
-    def contractDetailsEnd(self, reqId: int):
-        """End of contract details"""
-        pass
-    
-    def error(self, reqId: int, errorCode: int, errorString: str):
-        """Error callback"""
-        msg = f"Error {errorCode}: {errorString}"
-        self.errors.append((reqId, errorCode, errorString))
-
-        # Completely suppress specific errors that are common or benign
-        if errorCode in (200, 10167, 10090):
+    def error(self, reqId, *args):
+        if len(args) >= 3 and isinstance(args[1], int):
+            # Newer API: errorTime, errorCode, errorString, ...
+            error_code = args[1]
+            error_string = args[2]
+        elif len(args) >= 2:
+            # Older API: errorCode, errorString, ...
+            error_code = args[0]
+            error_string = args[1]
+        else:
             return
-        logger.error(msg)
+        message = f"IBKR {error_code}: {error_string}"
+        self.errors.append((reqId, error_code, str(error_string)))
+        with self.margin_lock:
+            events = [
+                self.what_if_events.get(reqId),
+                self.contract_details_events.get(reqId),
+            ]
+            if any(event is not None for event in events):
+                # Conservatively block the preview on request-specific messages.
+                self.request_errors[reqId] = message
+                for event in events:
+                    if event:
+                        event.set()
+        logger.error("Request %s: %s", reqId, message)
     
     def connectionClosed(self):
         """Called when connection closes"""
@@ -257,6 +312,8 @@ class IBKRConnectionManager:
         self.connect_lock = threading.Lock()
         self.current_client_id = self.primary_client_id
         self._next_req_id_counter = 10000
+        self._request_id_lock = threading.Lock()
+        self.margin_preview_lock = threading.RLock()
         
         logger.info(f"IBKRConnectionManager initialized")
         logger.info(f"  OS: {system}")
@@ -264,6 +321,12 @@ class IBKRConnectionManager:
         logger.info(f"  Host: {self.host}")
         logger.info(f"  Port: {self.port}")
         logger.info(f"  Primary Client ID: {self.primary_client_id}")
+
+    def allocate_request_id(self):
+        with self._request_id_lock:
+            req_id = self._next_req_id_counter
+            self._next_req_id_counter += 1
+            return req_id
     
     @classmethod
     def get_instance(cls) -> 'IBKRConnectionManager':
@@ -558,8 +621,7 @@ class IBKRConnectionManager:
         self.wrapper.account_summary_data = {}
         self.wrapper.account_summary_end_event.clear()
 
-        req_id = self._next_req_id_counter
-        self._next_req_id_counter += 1
+        req_id = self.allocate_request_id()
 
         logger.info("Requesting account margin summary...")
         self.client.reqAccountSummary(
@@ -578,221 +640,221 @@ class IBKRConnectionManager:
         logger.info(f"Margin summary: {summary}")
         return summary
     
-    def resolve_option_conid(self, leg: dict, timeout: float = 5.0) -> Optional[int]:
-        """
-        Resolve an option leg to its IBKR contract ID (conId).
-        
-        Args:
-            leg: Dict with symbol, secType, exchange, currency, strike, right, expiry
-            timeout: Timeout in seconds
-        
-        Returns:
-            conId (int) or None
-        """
+    def resolve_option_conid(self, leg, timeout=10.0):
         if not self.is_connected:
-            logger.error("IBKR not connected for conId resolution")
-            return None
-        
+            raise RuntimeError("IBKR is not connected")
+        wrapper = self.get_wrapper()
         client = self.get_client()
-        if client is None:
-            return None
-        
-        req_id = self._next_req_id_counter
-        self._next_req_id_counter += 1
-        
         contract = Contract()
         contract.symbol = leg["symbol"]
         contract.secType = "OPT"
-        contract.exchange = leg.get("exchange", "CBOE")
+        contract.exchange = leg.get("exchange", "SMART")
         contract.currency = leg.get("currency", "USD")
         contract.lastTradeDateOrContractMonth = leg["expiry"]
         contract.strike = float(leg["strike"])
         contract.right = leg["right"]
         contract.multiplier = str(leg.get("multiplier", "100"))
-        
-        self.wrapper.contract_details[req_id] = None
-        client.reqContractDetails(req_id, contract)
-        
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            details = self.wrapper.contract_details.get(req_id)
-            if details:
-                con_id = details.contract.conId
-                logger.info(f"Resolved conId={con_id} for {leg['right']} {leg['strike']} {leg['expiry']}")
-                return con_id
-            time.sleep(0.05)
-        
-        logger.error(f"Failed to resolve conId for leg: {leg}")
-        return None
-    
+        # Require an explicit trading class to avoid SPX/SPXW ambiguity.
+        contract.tradingClass = leg["tradingClass"]
+
+        req_id = self.allocate_request_id()
+        event = threading.Event()
+        with wrapper.margin_lock:
+            wrapper.contract_details[req_id] = []
+            wrapper.contract_details_events[req_id] = event
+        try:
+            client.reqContractDetails(req_id, contract)
+            if not event.wait(timeout):
+                raise TimeoutError(
+                    f"Contract resolution timed out: {leg}"
+                )
+            with wrapper.margin_lock:
+                error = wrapper.request_errors.get(req_id)
+                matches = list(wrapper.contract_details[req_id])
+            if error:
+                raise RuntimeError(error)
+            if len(matches) != 1:
+                raise ValueError(
+                    f"Expected one exact contract; got {len(matches)}: {leg}"
+                )
+            resolved = matches[0].contract
+            if resolved.conId <= 0:
+                raise ValueError(f"Invalid conId for {leg}")
+            return resolved.conId
+        finally:
+            with wrapper.margin_lock:
+                wrapper.contract_details.pop(req_id, None)
+                wrapper.contract_details_events.pop(req_id, None)
+                wrapper.request_errors.pop(req_id, None)
+
     def check_combo_margin(
         self,
-        legs: List[Dict],
-        net_price: float,
-        action: str = "SELL",
-        quantity: int = 1,
-        timeout: float = 10.0,
-    ) -> dict:
+        legs,
+        net_price,
+        action="BUY",
+        quantity=1,
+        timeout=20.0,
+        account=None,
+        min_initial_headroom=0.0,
+        min_maintenance_headroom=0.0,
+    ):
         """
-        Use a WhatIf combo order to preview margin impact.
-        
-        Args:
-            legs: List of leg dicts (same format as place_combo_order)
-            net_price: Net limit price for the combo
-            action: "BUY" or "SELL" for the combo
-            quantity: Number of combo units
-            timeout: Timeout in seconds
-        
-        Returns:
-            dict with:
-                - can_trade: bool
-                - init_margin_change: float
-                - maint_margin_change: float
-                - equity_with_loan_change: float
-                - warning_text: str
-                - available_funds: float
-                - excess_liquidity: float
-                - estimated_requirement: float
+        Preview only. Leg actions describe the position obtained by BUYING the BAG.
+        With that convention:
+        BUY + negative price = receive credit.
+        BUY + positive price = pay debit.
+        Returned margin amounts are in account base currency.
         """
-        if not self.is_connected:
+        def margin_value(state, name):
+            raw = getattr(state, name, "")
+            value = float(raw)
+            if not math.isfinite(value) or abs(value) >= 1e100:
+                raise ValueError(f"Unavailable margin field {name}: {raw!r}")
+            return value
+
+        order_id = None
+        wrapper = None
+        try:
+            with self.margin_preview_lock:
+                if not self.is_connected:
+                    raise RuntimeError("IBKR not connected")
+                if not legs:
+                    raise ValueError("No combination legs supplied")
+                if type(quantity) is not int or quantity < 1:
+                    raise ValueError("Quantity must be a positive integer")
+                if action != "BUY":
+                    raise ValueError(
+                        "Use BUY with explicit leg directions and signed price"
+                    )
+                if not math.isfinite(float(net_price)):
+                    raise ValueError("Invalid combination price")
+
+                account = account or self.get_account()
+                wrapper = self.get_wrapper()
+                client = self.get_client()
+                if account not in wrapper.managed_accounts_list:
+                    raise ValueError("Account unavailable to this connection")
+
+                symbols = {leg["symbol"] for leg in legs}
+                currencies = {leg.get("currency", "USD") for leg in legs}
+                expiries = {leg["expiry"] for leg in legs}
+                if len(symbols) != 1 or len(currencies) != 1:
+                    raise ValueError("Mixed symbols/currencies unsupported here")
+                if len(expiries) != 1:
+                    raise ValueError("This preview expects a same-expiry package")
+
+                combo = Contract()
+                combo.symbol = next(iter(symbols))
+                combo.secType = "BAG"
+                combo.exchange = "SMART"
+                combo.currency = next(iter(currencies))
+                combo.comboLegs = []
+
+                for leg in legs:
+                    leg_action = leg["action"].upper()
+                    if leg_action not in ("BUY", "SELL"):
+                        raise ValueError("Invalid leg action")
+                    ratio = leg.get("ratio", 1)
+                    if type(ratio) is not int or ratio < 1:
+                        raise ValueError("Invalid leg ratio")
+
+                    # Resolve from exact contract details rather than trusting
+                    # a potentially stale conId on a reused dictionary.
+                    con_id = self.resolve_option_conid(leg, timeout=timeout)
+                    combo_leg = ComboLeg()
+                    combo_leg.conId = con_id
+                    combo_leg.ratio = ratio
+                    combo_leg.action = leg_action
+                    combo_leg.exchange = "SMART"
+                    combo.comboLegs.append(combo_leg)
+
+                order = Order()
+                order.account = account
+                order.action = "BUY"
+                order.totalQuantity = quantity
+                order.orderType = "LMT"
+                order.lmtPrice = float(net_price)  # Do not use abs().
+                order.tif = "DAY"
+                order.whatIf = True
+                order.transmit = True
+                order.eTradeOnly = False
+                order.firmQuoteOnly = False
+
+                order_id = self.get_next_order_id()
+                event = threading.Event()
+                with wrapper.margin_lock:
+                    wrapper.what_if_events[order_id] = event
+
+                client.placeOrder(order_id, combo, order)
+                if not event.wait(timeout):
+                    raise TimeoutError("IBKR margin preview timed out")
+
+                with wrapper.margin_lock:
+                    error = wrapper.request_errors.get(order_id)
+                    state = wrapper.what_if_order_states.get(order_id)
+                if error:
+                    raise RuntimeError(error)
+                if state is None:
+                    raise ValueError("IBKR returned no margin state")
+
+                fields = [
+                    "initMarginBefore",
+                    "initMarginChange",
+                    "initMarginAfter",
+                    "maintMarginBefore",
+                    "maintMarginChange",
+                    "maintMarginAfter",
+                    "equityWithLoanBefore",
+                    "equityWithLoanChange",
+                    "equityWithLoanAfter",
+                ]
+                values = {
+                    name: margin_value(state, name)
+                    for name in fields
+                }
+                initial_headroom = (
+                    values["equityWithLoanAfter"] - values["initMarginAfter"]
+                )
+                maintenance_headroom = (
+                    values["equityWithLoanAfter"] - values["maintMarginAfter"]
+                )
+                warning = getattr(state, "warningText", "") or ""
+                can_trade = (
+                    initial_headroom > float(min_initial_headroom)
+                    and maintenance_headroom > float(min_maintenance_headroom)
+                    and not warning.strip()
+                )
+                return {
+                    "can_trade": can_trade,
+                    "account": account,
+                    "preview_only": True,
+                    "reason": (
+                        "Configured margin checks passed"
+                        if can_trade
+                        else "Insufficient headroom or broker warning"
+                    ),
+                    "warning_text": warning,
+                    "init_margin_change": values["initMarginChange"],
+                    "maint_margin_change": values["maintMarginChange"],
+                    "equity_with_loan_change": values["equityWithLoanChange"],
+                    "initial_headroom": initial_headroom,
+                    "maintenance_headroom": maintenance_headroom,
+                    **values,
+                }
+        except Exception as exc:
+            logger.exception("Combination margin preview failed")
             return {
                 "can_trade": False,
-                "reason": "IBKR not connected",
+                "preview_only": True,
+                "reason": str(exc),
             }
-        
-        client = self.get_client()
-        wrapper = self.get_wrapper()
-        if client is None or wrapper is None:
-            return {
-                "can_trade": False,
-                "reason": "Client or wrapper not available",
-            }
-        
-        # Build BAG contract
-        combo = Contract()
-        combo.symbol = legs[0]["symbol"]
-        combo.secType = "BAG"
-        combo.exchange = legs[0].get("exchange", "CBOE")
-        combo.currency = legs[0].get("currency", "USD")
-        
-        combo_legs = []
-        for leg in legs:
-            con_id = leg.get("conId")
-            if con_id is None:
-                con_id = self.resolve_option_conid(leg)
-                if con_id is None:
-                    logger.error(f"Cannot build combo: failed to resolve conId for leg {leg}")
-                    return {
-                        "can_trade": False,
-                        "reason": f"Failed to resolve conId for leg {leg}",
-                    }
-                leg["conId"] = con_id  # Cache for future use
-            
-            combo_leg = ComboLeg()
-            combo_leg.conId = int(con_id)
-            combo_leg.ratio = int(leg.get("ratio", 1))
-            combo_leg.action = leg["action"].upper()
-            combo_leg.exchange = leg.get("exchange", "CBOE")
-            
-            combo_legs.append(combo_leg)
-        
-        combo.comboLegs = combo_legs
-        
-        # Build WhatIf order
-        order_id = self.get_next_order_id()
-        if order_id is None:
-            return {
-                "can_trade": False,
-                "reason": "No valid order ID",
-            }
-        
-        event = threading.Event()
-        wrapper.what_if_events[order_id] = event
-        wrapper.what_if_order_states[order_id] = None
-        
-        order = Order()
-        order.action = action.upper()
-        order.totalQuantity = int(quantity)
-        order.orderType = "LMT"
-        order.lmtPrice = abs(float(net_price))
-        order.tif = "DAY"
-        order.whatIf = True  # ← KEY: margin preview only
-        
-        logger.info(
-            f"Checking combo margin (WhatIf): action={order.action} qty={quantity} price={net_price} legs={len(combo_legs)}"
-        )
-        
-        client.placeOrder(order_id, combo, order)
-        
-        received = event.wait(timeout=timeout)
-        
-        order_state = wrapper.what_if_order_states.pop(order_id, None)
-        wrapper.what_if_events.pop(order_id, None)
-        
-        if not received or order_state is None:
-            return {
-                "can_trade": False,
-                "reason": "WhatIf margin response timed out",
-            }
-        
-        def numeric(value):
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                return None
-        
-        init_margin_change = numeric(getattr(order_state, "initMarginChange", None))
-        maint_margin_change = numeric(getattr(order_state, "maintMarginChange", None))
-        equity_with_loan_change = numeric(getattr(order_state, "equityWithLoanChange", None))
-        
-        account_margin = self.get_margin_summary(timeout=5)
-        
-        available_funds = numeric(account_margin.get("AvailableFunds"))
-        excess_liquidity = numeric(account_margin.get("ExcessLiquidity"))
-        
-        # Conservative safety test
-        estimated_requirement = max(
-            abs(init_margin_change or 0.0),
-            abs(maint_margin_change or 0.0),
-        )
-        
-        safety_buffer = 0.90
-        usable_funds = (
-            available_funds * safety_buffer
-            if available_funds is not None
-            else None
-        )
-        
-        can_trade = (
-            usable_funds is not None
-            and estimated_requirement <= usable_funds
-        )
-        
-        result = {
-            "can_trade": can_trade,
-            "order_id": order_id,
-            "init_margin_change": init_margin_change,
-            "maint_margin_change": maint_margin_change,
-            "equity_with_loan_change": equity_with_loan_change,
-            "estimated_requirement": estimated_requirement,
-            "available_funds": available_funds,
-            "excess_liquidity": excess_liquidity,
-            "usable_funds": usable_funds,
-            "warning_text": getattr(order_state, "warningText", ""),
-        }
-        
-        if can_trade:
-            logger.info(
-                f"✓ Combo margin check passed: requirement=${estimated_requirement:,.2f} available=${available_funds:,.2f}"
-            )
-        else:
-            logger.warning(
-                f"✗ Combo margin check failed: requirement=${estimated_requirement:,.2f} "
-                f"available=${available_funds:,.2f} warning={result['warning_text']}"
-            )
-        
-        return result
-    
+        finally:
+            if wrapper is not None and order_id is not None:
+                with wrapper.margin_lock:
+                    wrapper.what_if_events.pop(order_id, None)
+                    wrapper.what_if_order_states.pop(order_id, None)
+                    wrapper.request_errors.pop(order_id, None)
+
     def wait_for_fill(self, order_id: int, timeout: float = 10.0) -> bool:
         """Block until order is Filled or timeout expires."""
         deadline = time.time() + timeout
@@ -803,35 +865,40 @@ class IBKRConnectionManager:
             time.sleep(0.2)
         logger.warning(f"Order {order_id} did not fill within {timeout}s")
         return False
-    
+
     def cancel_order(self, order_id: int):
         if self.is_connected:
             self.client.cancelOrder(order_id)
             logger.info(f"Cancelled order {order_id}")
-    
+
     def get_wrapper(self) -> Optional[ConnectionWrapper]:
         """Get wrapper instance (for callbacks)"""
         if self.is_connected:
             return self.wrapper
         return None
-    
+
     def get_client(self) -> Optional[EClient]:
         """Get EClient instance"""
         if self.is_connected:
             return self.client
         return None
-    
+
     def get_account(self) -> Optional[str]:
         """Get current account ID"""
         if self.is_connected and self.wrapper:
             return self.wrapper.account_id
         return None
-    
-    def get_next_order_id(self) -> Optional[int]:
-        """Get next valid order ID"""
-        if self.is_connected and self.wrapper:
-            return self.wrapper.next_valid_order_id
-        return None
+
+    def get_next_order_id(self):
+        wrapper = self.get_wrapper()
+        if wrapper is None:
+            raise RuntimeError("IBKR wrapper unavailable")
+        with wrapper.order_id_lock:
+            order_id = wrapper.next_valid_order_id
+            if order_id is None:
+                raise RuntimeError("IBKR next valid order ID unavailable")
+            wrapper.next_valid_order_id += 1
+            return order_id
     
     def get_current_client_id(self) -> int:
         """Get current client ID being used"""

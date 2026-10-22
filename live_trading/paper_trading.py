@@ -5,6 +5,7 @@ import threading
 import time as time_module
 from pathlib import Path
 from datetime import datetime
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -500,13 +501,225 @@ class PaperTrader:
         return contract
 
     def _next_order_id(self):
-        wrapper = self.conn_mgr.get_wrapper()
-        if wrapper is None or wrapper.next_valid_order_id is None:
-            raise RuntimeError("IBKR next order ID is not available")
+        return self.conn_mgr.get_next_order_id()
 
-        order_id = wrapper.next_valid_order_id
-        wrapper.next_valid_order_id += 1
-        return order_id
+    def _preview_selected_condor(
+        self,
+        positions,
+        quantity,
+        account,
+        min_initial_headroom=0.0,
+        min_maintenance_headroom=0.0,
+    ):
+        """
+        positions: the four selected leg dictionaries.
+        Each needs underlying, expiry, strike, right, action, price.
+        price must come from a current usable quote, not an intrinsic-value fallback
+        or an assumed historic fill.
+        """
+        if len(positions) != 4:
+            return {
+                "can_trade": False,
+                "reason": "Expected four condor legs",
+            }
+
+        legs = []
+        credit_points = 0.0
+
+        for position in positions:
+            price = float(position["price"])
+            if not math.isfinite(price) or price <= 0:
+                return {
+                    "can_trade": False,
+                    "reason": "Missing or invalid leg quote",
+                }
+
+            action = position["action"].upper()
+            if action not in ("BUY", "SELL"):
+                return {
+                    "can_trade": False,
+                    "reason": "Invalid leg action",
+                }
+
+            credit_points += price if action == "SELL" else -price
+
+            legs.append({
+                "symbol": position["underlying"],
+                "expiry": position["expiry"],
+                "strike": float(position["strike"]),
+                "right": position["right"],
+                "action": action,
+                "ratio": 1,
+                "exchange": "SMART",
+                "currency": "USD",
+                "multiplier": "100",
+                "tradingClass": position.get("tradingClass", "SPXW"),
+            })
+
+        if credit_points <= 0:
+            return {
+                "can_trade": False,
+                "reason": "Selected package is not a net-credit condor",
+            }
+
+                  
+        import inspect
+        import time
+
+        try:
+            method = self.conn_mgr.check_combo_margin
+
+            logger.info(
+                "Margin preview implementation: class=%s module=%s signature=%s",
+                type(self.conn_mgr).__name__,
+                inspect.getmodule(method).__name__
+                if inspect.getmodule(method) else "unknown",
+                inspect.signature(method),
+            )
+
+            logger.info(
+                "Margin preview inputs: account=%r quantity=%r "
+                "credit_points=%r net_price=%r legs=%r",
+                account,
+                quantity,
+                credit_points,
+                -credit_points,
+                legs,
+            )
+
+            started = time.monotonic()
+
+            result = method(
+                legs=legs,
+                net_price=-credit_points,
+                action="BUY",
+                quantity=quantity,
+                account=account,
+                timeout=30.0,
+                min_initial_headroom=min_initial_headroom,
+                min_maintenance_headroom=min_maintenance_headroom,
+            )
+
+            elapsed = time.monotonic() - started
+
+            logger.info(
+                "Margin preview returned after %.2fs: %r",
+                elapsed,
+                result,
+            )
+
+            if not isinstance(result, dict):
+                raise TypeError(
+                    "check_combo_margin must return a dictionary; "
+                    f"received {type(result).__name__}: {result!r}"
+                )
+
+            if not result.get("can_trade", False):
+                logger.warning(
+                    "Margin preview BLOCKED: reason=%r warning=%r "
+                    "initial_headroom=%r maintenance_headroom=%r",
+                    result.get("reason"),
+                    result.get("warning_text"),
+                    result.get("initial_headroom"),
+                    result.get("maintenance_headroom"),
+                )
+            else:
+                logger.info(
+                    "Margin preview PASSED: initial_headroom=%r "
+                    "maintenance_headroom=%r",
+                    result.get("initial_headroom"),
+                    result.get("maintenance_headroom"),
+                )
+
+            return result
+
+        except Exception as exc:
+            logger.exception("Margin preview invocation failed")
+
+            return {
+                "can_trade": False,
+                "reason": f"{type(exc).__name__}: {exc}",
+            }
+
+
+        return self.conn_mgr.check_combo_margin(
+            legs=legs,
+            net_price=-credit_points,
+            action="BUY",
+            quantity=quantity,
+            account=account,
+            min_initial_headroom=min_initial_headroom,
+            min_maintenance_headroom=min_maintenance_headroom,
+        )
+
+    def _preview_replacement_spread(
+        self,
+        replacement_short,
+        replacement_hedge,
+        quantity,
+        account=None,
+        min_initial_headroom=0.0,
+        min_maintenance_headroom=0.0,
+    ):
+        """
+        Validate pricing and margin impact via combo What-If order
+        before submitting replacement adjustment legs.
+        """
+        try:
+            short_price = float(replacement_short["price"])
+            hedge_price = float(replacement_hedge["price"])
+            if not (math.isfinite(short_price) and short_price > 0 and math.isfinite(hedge_price) and hedge_price > 0):
+                return {"can_trade": False, "reason": "Missing or non-positive price for replacement leg"}
+
+            net_credit = short_price - hedge_price
+            if net_credit <= 0:
+                logger.warning(f"Replacement spread is net debit ({net_credit:.2f}), proceeding with caution")
+
+            legs = [
+                {
+                    "symbol": replacement_short["underlying"],
+                    "expiry": replacement_short["expiry"],
+                    "strike": float(replacement_short["strike"]),
+                    "right": replacement_short["right"],
+                    "action": "SELL",
+                    "ratio": 1,
+                    "exchange": "SMART",
+                    "currency": "USD",
+                    "multiplier": "100",
+                    "tradingClass": replacement_short.get("tradingClass", "SPXW"),
+                },
+                {
+                    "symbol": replacement_hedge["underlying"],
+                    "expiry": replacement_hedge["expiry"],
+                    "strike": float(replacement_hedge["strike"]),
+                    "right": replacement_hedge["right"],
+                    "action": "BUY",
+                    "ratio": 1,
+                    "exchange": "SMART",
+                    "currency": "USD",
+                    "multiplier": "100",
+                    "tradingClass": replacement_hedge.get("tradingClass", "SPXW"),
+                },
+            ]
+
+            if not self.is_paper:
+                from config import apikey_config
+                account = apikey_config.get("ibkr_live_account") or self.conn_mgr.get_account()
+            else:
+                account = account or self.conn_mgr.get_account()
+
+            return self.conn_mgr.check_combo_margin(
+                legs=legs,
+                net_price=-net_credit,
+                action="BUY",
+                quantity=int(quantity),
+                account=account,
+                min_initial_headroom=min_initial_headroom,
+                min_maintenance_headroom=min_maintenance_headroom,
+            )
+        except Exception as e:
+            logger.error(f"Error checking margin for replacement spread: {e}")
+            return {"can_trade": False, "reason": str(e)}
 
     def _place_option_order(self, position, quantity):
         from ibapi.order import Order
@@ -542,6 +755,7 @@ class PaperTrader:
             order.account = account
 
         order_id = self._next_order_id()
+        
         client.placeOrder(order_id, contract, order)
         return order_id
 
@@ -700,6 +914,31 @@ class PaperTrader:
             
             if not positions:
                 logger.warning(f"No positions selected for cycle {self.cycle_id}")
+                return []
+
+            from config import apikey_config
+            account = (
+                self.conn_mgr.get_account()
+                if self.is_paper
+                else (
+                    apikey_config.get("ibkr_live_account")
+                    or self.conn_mgr.get_account()
+                )
+            )
+
+            preview = self._preview_selected_condor(
+                positions=positions,
+                quantity=quantity,
+                account=account,
+                min_initial_headroom=0.0,
+                min_maintenance_headroom=0.0,
+            )
+            logger.info("Selected condor margin preview: %s", preview)
+            if not preview["can_trade"]:
+                logger.warning(
+                    "Not opening this candidate: %s",
+                    preview.get("reason"),
+                )
                 return []
             
             hedge_orders = [p for p in positions if p["action"] == "BUY"]
@@ -1012,6 +1251,20 @@ class PaperTrader:
                 replacement_hedge = self._position_from_row(hedge_row, "B", "BUY", short_type, quantity, cycle_id)
                 if replacement_short is None or replacement_hedge is None:
                     results[cycle_id] = {"status": "open_replacement_failed", "current_delta": current_delta}
+                    continue
+
+                # Preview replacement spread margin / what-if before submitting new orders
+                preview = self._preview_replacement_spread(replacement_short, replacement_hedge, quantity)
+                logger.info(f"  Cycle {cycle_id}: replacement spread margin preview: {preview}")
+                if not preview.get("can_trade", False):
+                    logger.warning(
+                        f"  Cycle {cycle_id}: rejecting adjustment execution, margin preview failed: {preview.get('reason')}"
+                    )
+                    results[cycle_id] = {
+                        "status": "adjustment_margin_check_failed",
+                        "reason": preview.get("reason"),
+                        "current_delta": current_delta,
+                    }
                     continue
 
                 self._submit_new_position(replacement_short)
