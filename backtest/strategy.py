@@ -609,7 +609,21 @@ class DeltaNeutralStrategy:
             highest_pnl = max(highest_pnl, current_pnl)
             lowest_pnl = min(lowest_pnl, current_pnl)
 
-            
+            # Check stop loss if configured
+            max_loss_stop_loss = self.config.get("max_loss_stop_loss")
+            if max_loss_stop_loss is not None and current_pnl <= -abs(float(max_loss_stop_loss)):
+                logging.warning(
+                    f"Stop loss triggered at {bucket_ts}: current PnL ${current_pnl:.2f} <= -${abs(float(max_loss_stop_loss)):.2f}"
+                )
+                self.close_all_positions(
+                    bucket_ts,
+                    bucket_df,
+                    "stop_loss",
+                    highest_pnl,
+                    lowest_pnl
+                )
+                continue
+
             outside_breakeven = current_spot < lower_breakeven or current_spot > upper_breakeven
 
             max_adjusts = self.config["max_adjusts"]

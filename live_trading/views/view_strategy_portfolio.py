@@ -11,9 +11,12 @@ Replace `get_quote_provider()` with IBKRQuoteAdapter after you wire the exact
 IBKRClient method into `live_trading/portfolio/market_data.py`.
 """
 
+from __future__ import annotations
+
 import os
 import sys
 from datetime import date
+from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -30,6 +33,11 @@ from live_trading.portfolio.market_data import ManualQuoteProvider
 from live_trading.portfolio.payoff import build_payoff_curves
 from live_trading.portfolio.repository import PortfolioRepository
 from live_trading.portfolio.valuation import value_open_lots, portfolio_summary
+
+try:
+    from IBKRConnectionManager import get_ibkr_connection
+except ImportError:
+    get_ibkr_connection = None
 
 
 st.set_page_config(
@@ -56,6 +64,173 @@ def get_quote_provider() -> ManualQuoteProvider:
         return IBKRQuoteAdapter(st.session_state.ibkr_client)
     """
     return ManualQuoteProvider()
+
+
+def parse_ibkr_position(raw_pos: dict) -> Optional[dict]:
+    """Parse raw position dict from IBKR into standard SPX option format."""
+    sec_type = raw_pos.get("secType")
+    symbol = raw_pos.get("symbol", "")
+    position_qty = raw_pos.get("position", 0)
+
+    if position_qty == 0:
+        return None
+
+    # Handle SPX / SPXW option positions
+    if sec_type == "OPT" and ("SPX" in symbol):
+        raw_expiry = str(raw_pos.get("expiry", ""))
+        try:
+            if len(raw_expiry) == 8:
+                expiry_dt = date(int(raw_expiry[:4]), int(raw_expiry[4:6]), int(raw_expiry[6:]))
+            else:
+                expiry_dt = date.fromisoformat(raw_expiry)
+        except Exception:
+            return None
+
+        strike = float(raw_pos.get("strike", 0.0))
+        right_raw = str(raw_pos.get("right", "")).upper()
+        right = "C" if right_raw in ("C", "CALL") else "P"
+
+        avg_cost = float(raw_pos.get("avgCost", 0.0))
+        # IBKR option avgCost is typically contract total (price * 100). Convert to per-share option price.
+        unit_price = avg_cost / 100.0 if avg_cost > 500 else avg_cost
+
+        return {
+            "account": raw_pos.get("account", ""),
+            "symbol": symbol,
+            "secType": sec_type,
+            "expiry": expiry_dt,
+            "strike": strike,
+            "right": right,
+            "quantity": int(position_qty),
+            "entry_price": max(round(unit_price, 2), 0.0),
+        }
+    return None
+
+
+def render_ibkr_import_panel(
+    repo: PortfolioRepository,
+    ledger,
+    strategy_id: str,
+) -> None:
+    st.subheader("Import positions from IBKR")
+
+    if get_ibkr_connection is None:
+        st.warning("IBKRConnectionManager is not available in path.")
+        return
+
+    # Check IBKR connection status
+    col_conn1, col_conn2 = st.columns([3, 1])
+    with col_conn1:
+        st.caption("Connect to your active IBKR TWS / Gateway session to preview and import live SPX positions.")
+
+    if "ibkr_positions_preview" not in st.session_state:
+        st.session_state.ibkr_positions_preview = None
+
+    conn_mgr = get_ibkr_connection(is_paper=False)
+
+    btn_label = "Connect & Fetch IBKR Positions" if not conn_mgr.is_connected else "Fetch IBKR Positions"
+    if st.button(btn_label, type="secondary"):
+        with st.spinner("Connecting to IBKR and fetching open positions..."):
+            if not conn_mgr.is_connected:
+                success = conn_mgr.connect(timeout=8, max_retries=3)
+                if not success:
+                    st.error("Failed to connect to IBKR TWS / Gateway. Please ensure TWS or Gateway is running with API connections enabled.")
+                    return
+            
+            raw_positions = conn_mgr.get_all_positions(timeout=5)
+            spx_positions = []
+            for p in raw_positions:
+                parsed = parse_ibkr_position(p)
+                if parsed:
+                    spx_positions.append(parsed)
+
+            if not spx_positions:
+                st.info(f"Connected to IBKR successfully, but found 0 open SPX option positions (total {len(raw_positions)} positions returned).")
+                st.session_state.ibkr_positions_preview = []
+            else:
+                st.session_state.ibkr_positions_preview = spx_positions
+
+    preview_positions = st.session_state.get("ibkr_positions_preview")
+    if preview_positions is not None:
+        if len(preview_positions) == 0:
+            st.info("No SPX option positions available in IBKR preview.")
+            return
+
+        st.markdown("**Preview & Select Legs to Import:**")
+        
+        # Prepare preview table with selection
+        preview_data = []
+        for i, pos in enumerate(preview_positions):
+            preview_data.append({
+                "Import": True,
+                "Expiry": pos["expiry"].isoformat(),
+                "Strike": pos["strike"],
+                "Right": pos["right"],
+                "Quantity": pos["quantity"],
+                "Entry Price": pos["entry_price"],
+                "Commission": 1.20,
+                "Symbol": pos["symbol"],
+                "Account": pos["account"],
+            })
+
+        preview_df = pd.DataFrame(preview_data)
+
+        edited_df = st.data_editor(
+            preview_df,
+            key=f"ibkr_import_editor_{strategy_id}",
+            width="stretch",
+            hide_index=True,
+            disabled=["Expiry", "Strike", "Right", "Symbol", "Account"],
+            column_config={
+                "Import": st.column_config.CheckboxColumn("Import?", default=True),
+                "Expiry": st.column_config.TextColumn("Expiry"),
+                "Strike": st.column_config.NumberColumn("Strike", format="%.0f"),
+                "Right": st.column_config.TextColumn("Right"),
+                "Quantity": st.column_config.NumberColumn("Quantity (+long / -short)", step=1),
+                "Entry Price": st.column_config.NumberColumn("Entry Price", format="%.2f", step=0.05),
+                "Commission": st.column_config.NumberColumn("Commission", format="%.2f", step=0.10),
+            },
+        )
+
+        selected_rows = edited_df[edited_df["Import"] == True]
+
+        st.caption(f"Selected {len(selected_rows)} of {len(preview_df)} position(s) for import.")
+
+        if st.button("Import Selected Legs into Strategy", type="primary", disabled=selected_rows.empty):
+            new_fills = []
+            new_lots = []
+
+            for _, row in selected_rows.iterrows():
+                qty = int(row["Quantity"])
+                if qty == 0:
+                    continue
+
+                exp = date.fromisoformat(row["Expiry"])
+                fill = Fill.create(
+                    strategy_id=strategy_id,
+                    expiry=exp,
+                    strike=float(row["Strike"]),
+                    right=str(row["Right"]),
+                    quantity=qty,
+                    price=float(row["Entry Price"]),
+                    commission=float(row["Commission"]),
+                    source="IBKR",
+                )
+                lot = ledger.apply_fill(fill)
+                new_fills.append(fill)
+                new_lots.append(lot)
+
+            if new_fills:
+                repo.persist_ledger_delta(
+                    ledger=ledger,
+                    new_fills=new_fills,
+                    new_lots=new_lots,
+                    new_closes=[],
+                )
+                repo.con.commit()
+                st.session_state.ibkr_positions_preview = None
+                st.success(f"Successfully imported {len(new_fills)} leg(s) from IBKR into the strategy.")
+                st.rerun()
 
 
 def render_debug_panel(
@@ -690,6 +865,12 @@ def main() -> None:
         repo=repo,
         strategy_id=current_strategy.strategy_id,
         ledger=ledger,
+    )
+
+    render_ibkr_import_panel(
+        repo=repo,
+        ledger=ledger,
+        strategy_id=current_strategy.strategy_id,
     )
 
     render_add_leg_form(

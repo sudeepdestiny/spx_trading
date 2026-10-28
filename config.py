@@ -1,10 +1,10 @@
 STRATEGY_CONFIG = {
     'symbol': '^SPX',
     'sell_delta': 0.15,
-    'pos_delta_thresh': 0.25,
+    'pos_delta_thresh': 0.20,
     'hedge_dist': 80,
     'lot_size': 100,
-    'dte_days': 4,  # ← Change to 0 for same-day expiry
+    'dte_days': 6,  # ← Change to 0 for same-day expiry
     'start_date': '2026-03-02',
     'end_date': '2026-03-06',  # ← Single day for 0 DTE
     'volatility': 0.15,
@@ -18,6 +18,7 @@ STRATEGY_CONFIG = {
     "expiry_hour": 15,  # ← Earlier for 0 DTE (before market close)
     "price_bar_size": "5 mins",    # ← Add
     "iv_bar_size": "30 mins",
+    "max_loss_stop_loss": 250.0,  # Max allowable cycle loss ($) before triggering stop-loss exit
 }
 
 import os

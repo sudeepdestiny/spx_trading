@@ -191,6 +191,7 @@ def run_live_trading(is_paper: bool = False):
                             underlying="SPX",
                             required_strikes=required_strikes,
                             expiry=open_expiry,
+                            marketData=1
                         )
 
                         if not option_chain.empty:

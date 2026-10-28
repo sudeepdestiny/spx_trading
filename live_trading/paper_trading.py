@@ -188,7 +188,7 @@ class PaperTrader:
         """Fetch raw positions directly from IBKR"""
         return self.conn_mgr.get_all_positions()
     
-    def get_live_option_chain(self, underlying="SPX", dte_days=5, required_strikes=None, expiry=None):
+    def get_live_option_chain(self, underlying="SPX", dte_days=5, required_strikes=None, expiry=None,marketData=3):
         """
         Fetch live option chain from IBKR
         
@@ -218,7 +218,7 @@ class PaperTrader:
                 logger.error("IBKR client/wrapper unavailable")
                 return pd.DataFrame()
 
-            client.reqMarketDataType(3)
+            client.reqMarketDataType(marketData)
 
             if not hasattr(wrapper, "market_data_lock"):
                 wrapper.market_data_lock = threading.Lock()
@@ -642,15 +642,7 @@ class PaperTrader:
             }
 
 
-        return self.conn_mgr.check_combo_margin(
-            legs=legs,
-            net_price=-credit_points,
-            action="BUY",
-            quantity=quantity,
-            account=account,
-            min_initial_headroom=min_initial_headroom,
-            min_maintenance_headroom=min_maintenance_headroom,
-        )
+
 
     def _preview_replacement_spread(
         self,
@@ -874,48 +866,6 @@ class PaperTrader:
                 logger.warning("No valid call/put candidates with deltas and prices")
                 return []
 
-            short_call, hedge_call = self._select_short_with_hedge(chain, call_candidates, "CE", target_delta, hedge_dist)
-            short_put, hedge_put = self._select_short_with_hedge(chain, put_candidates, "PE", target_delta, hedge_dist)
-
-            if hedge_call is None or hedge_put is None:
-                logger.warning("Could not find hedge legs for selected short strikes")
-                return []
-
-            legs = [
-                ("S", "SELL", "CE", "C", short_call, float(short_call["call_delta"])),
-                ("S", "SELL", "PE", "P", short_put, float(short_put["put_delta"])),
-                ("B", "BUY", "CE", "C", hedge_call, float(hedge_call["call_delta"])),
-                ("B", "BUY", "PE", "P", hedge_put, float(hedge_put["put_delta"])),
-            ]
-
-            positions = []
-            for side, action, option_type, right, row, delta in legs:
-                price = self._option_price(row, option_type, side)
-                if price is None:
-                    logger.warning(f"No usable {option_type} price for strike {row['strike']}")
-                    return []
-
-                positions.append({
-                    "cycle_id": self.cycle_id,
-                    "underlying": row.get("underlying", "SPX"),
-                    "expiry": str(row["expiry"]),
-                    "strike": float(row["strike"]),
-                    "type": option_type,
-                    "right": right,
-                    "side": side,
-                    "action": action,
-                    "quantity": int(quantity),
-                    "price": price,
-                    "entry_price": price,
-                    "delta": delta,
-                    "order_id": None,
-                    "status": "PENDING_SUBMIT" if submit_orders else "DRY_RUN",
-                })
-            
-            if not positions:
-                logger.warning(f"No positions selected for cycle {self.cycle_id}")
-                return []
-
             from config import apikey_config
             account = (
                 self.conn_mgr.get_account()
@@ -926,20 +876,90 @@ class PaperTrader:
                 )
             )
 
-            preview = self._preview_selected_condor(
-                positions=positions,
-                quantity=quantity,
-                account=account,
-                min_initial_headroom=0.0,
-                min_maintenance_headroom=0.0,
-            )
-            logger.info("Selected condor margin preview: %s", preview)
-            if not preview["can_trade"]:
-                logger.warning(
-                    "Not opening this candidate: %s",
-                    preview.get("reason"),
+            # Generate candidate hedge distances (start at requested hedge_dist, stepping down by 10 points)
+            # Minimum hedge distance is 20 points
+            candidate_hedge_dists = []
+            curr_dist = hedge_dist
+            while curr_dist >= 20:
+                candidate_hedge_dists.append(curr_dist)
+                curr_dist -= 10
+            if not candidate_hedge_dists:
+                candidate_hedge_dists = [hedge_dist]
+
+            selected_positions = []
+            selected_hedge_dist = hedge_dist
+            selected_preview = None
+
+            for h_dist in candidate_hedge_dists:
+                short_call, hedge_call = self._select_short_with_hedge(chain, call_candidates, "CE", target_delta, h_dist)
+                short_put, hedge_put = self._select_short_with_hedge(chain, put_candidates, "PE", target_delta, h_dist)
+
+                if hedge_call is None or hedge_put is None:
+                    continue
+
+                legs = [
+                    ("S", "SELL", "CE", "C", short_call, float(short_call["call_delta"])),
+                    ("S", "SELL", "PE", "P", short_put, float(short_put["put_delta"])),
+                    ("B", "BUY", "CE", "C", hedge_call, float(hedge_call["call_delta"])),
+                    ("B", "BUY", "PE", "P", hedge_put, float(hedge_put["put_delta"])),
+                ]
+
+                positions = []
+                price_failed = False
+                for side, action, option_type, right, row, delta in legs:
+                    price = self._option_price(row, option_type, side)
+                    if price is None:
+                        price_failed = True
+                        break
+
+                    positions.append({
+                        "cycle_id": self.cycle_id,
+                        "underlying": row.get("underlying", "SPX"),
+                        "expiry": str(row["expiry"]),
+                        "strike": float(row["strike"]),
+                        "type": option_type,
+                        "right": right,
+                        "side": side,
+                        "action": action,
+                        "quantity": int(quantity),
+                        "price": price,
+                        "entry_price": price,
+                        "delta": delta,
+                        "order_id": None,
+                        "status": "PENDING_SUBMIT" if submit_orders else "DRY_RUN",
+                    })
+
+                if price_failed or len(positions) != 4:
+                    continue
+
+                preview = self._preview_selected_condor(
+                    positions=positions,
+                    quantity=quantity,
+                    account=account,
+                    min_initial_headroom=0.0,
+                    min_maintenance_headroom=0.0,
                 )
+                logger.info("Candidate condor margin preview (hedge_dist=%s): %s", h_dist, preview)
+
+                if preview["can_trade"]:
+                    selected_positions = positions
+                    selected_hedge_dist = h_dist
+                    selected_preview = preview
+                    break
+                else:
+                    logger.warning(
+                        "Candidate condor with hedge_dist=%s blocked by margin check (%s). Trying narrower hedge...",
+                        h_dist,
+                        preview.get("reason"),
+                    )
+
+            if not selected_positions:
+                logger.warning("Could not find a feasible condor passing margin checks for cycle %s", self.cycle_id)
                 return []
+
+            positions = selected_positions
+            hedge_dist = selected_hedge_dist
+            logger.info("Proceeding to execute cycle %s with approved hedge_dist=%s", self.cycle_id, hedge_dist)
             
             hedge_orders = [p for p in positions if p["action"] == "BUY"]
             short_orders = [p for p in positions if p["action"] == "SELL"]
@@ -1032,6 +1052,8 @@ class PaperTrader:
                 missing.append(f"{pos['type']} {pos['strike']:.0f}")
                 delta = float(pos.get("delta", 0.0))
 
+            logger.info(f" Delta for {pos['type']} {pos['strike']:.0f} {delta}" )
+
             side_multiplier = -1 if pos["side"] == "S" else 1
             total_delta += delta * side_multiplier * int(pos.get("quantity", 1))
 
@@ -1039,6 +1061,37 @@ class PaperTrader:
             logger.warning(f"Using stored deltas for missing current legs: {', '.join(missing)}")
 
         return total_delta
+
+    def _calculate_current_cycle_pnl(self, option_chain, pos_data):
+        """
+        Calculate total P&L (realized from closed legs + unrealized from open legs) for a cycle.
+        """
+        lot_size = self.strategy.config.get("lot_size", 100)
+        total_pnl = 0.0
+
+        for pos in pos_data.get("positions", []):
+            quantity = int(pos.get("quantity", 1))
+            entry_price = float(pos.get("entry_price", pos.get("price", 0.0)))
+
+            if pos.get("status") == "CLOSED":
+                total_pnl += float(pos.get("pnl", 0.0))
+                continue
+
+            # Estimate open leg current value
+            row = self._find_chain_row(option_chain, pos["strike"])
+            close_side = "B" if pos["side"] == "S" else "S"
+            curr_price = None
+            if row is not None:
+                curr_price = self._option_price(row, pos["type"], close_side)
+
+            if curr_price is None:
+                curr_price = entry_price
+
+            leg_pnl = (entry_price - curr_price) * lot_size * quantity if pos["side"] == "S" else (curr_price - entry_price) * lot_size * quantity
+            logger.info(f"  Leg {pos['type']} {pos['strike']:.0f}: entry_price={entry_price:.2f}, curr_price={curr_price:.2f}, leg_pnl={leg_pnl:.2f}")
+            total_pnl += leg_pnl
+
+        return total_pnl
 
     def _find_open_short(self, positions, option_type):
         for pos in positions:
@@ -1179,6 +1232,28 @@ class PaperTrader:
                 max_adjusts = self.strategy.config.get("max_adjusts", 3)
                 adjustments = pos_data.get("adjustments", 0)
 
+                # Stop loss check based on strategy config (e.g. $250 max loss)
+                max_loss_stop_loss = self.strategy.config.get("max_loss_stop_loss")
+                if max_loss_stop_loss is not None:
+                    current_cycle_pnl = self._calculate_current_cycle_pnl(option_chain, pos_data)
+                    logger.info(
+                        f"  Cycle {cycle_id}: current_pnl=${current_cycle_pnl:.2f}, "
+                        f"stop_loss_limit=-${max_loss_stop_loss:.2f}"
+                    )
+                    if current_cycle_pnl <= -abs(float(max_loss_stop_loss)):
+                        logger.warning(
+                            f"🛑 STOP LOSS TRIGGERED for Cycle {cycle_id}: "
+                            f"Current PnL ${current_cycle_pnl:.2f} <= -${abs(float(max_loss_stop_loss)):.2f}. "
+                            f"Closing all cycle positions!"
+                        )
+                        close_res = self.close_positions_at_expiry(cycle_id, option_chain=option_chain, reason="stop_loss")
+                        results[cycle_id] = {
+                            "status": "stop_loss_triggered",
+                            "pnl": current_cycle_pnl,
+                            "close_result": close_res,
+                        }
+                        continue
+
                 logger.info(
                     f"  Cycle {cycle_id}: current_delta={current_delta:.4f}, "
                     f"threshold={pos_delta_thresh:.4f}, adjustments={adjustments}/{max_adjusts}"
@@ -1229,11 +1304,73 @@ class PaperTrader:
                         results[cycle_id] = {"status": "replacement_crosses_opposite_short", "current_delta": current_delta}
                         continue
 
-                hedge_row = self._find_hedge_row(option_chain, float(new_short["strike"]), short_type, hedge_dist)
-                if hedge_row is None:
-                    logger.warning(f"  Cycle {cycle_id}: no replacement {short_type} hedge found")
-                    results[cycle_id] = {"status": "no_replacement_hedge", "current_delta": current_delta}
+                quantity = pos_data.get("quantity", 1)
+                replacement_short = self._position_from_row(new_short, "S", "SELL", short_type, quantity, cycle_id)
+                if replacement_short is None:
+                    results[cycle_id] = {"status": "open_replacement_failed", "current_delta": current_delta}
                     continue
+
+                # Try candidate hedge distances starting at hedge_dist, adjusting until margin preview passes
+                # Generate candidate hedge distances (e.g. stepping up or trying alternate distances)
+                candidate_dists = []
+                for step in range(0, 100, 10):
+                    candidate_dists.append(hedge_dist + step)
+                    if hedge_dist - step >= 20 and step != 0:
+                        candidate_dists.append(hedge_dist - step)
+
+                selected_hedge_row = None
+                selected_replacement_hedge = None
+                selected_preview = None
+                seen_strikes = set()
+
+                for candidate_h_dist in candidate_dists:
+                    candidate_hedge_row = self._find_hedge_row(
+                        option_chain, float(new_short["strike"]), short_type, candidate_h_dist, log_fallback=False
+                    )
+                    if candidate_hedge_row is None:
+                        continue
+
+                    candidate_strike = float(candidate_hedge_row["strike"])
+                    if candidate_strike in seen_strikes:
+                        continue
+                    seen_strikes.add(candidate_strike)
+
+                    candidate_replacement_hedge = self._position_from_row(
+                        candidate_hedge_row, "B", "BUY", short_type, quantity, cycle_id
+                    )
+                    if candidate_replacement_hedge is None:
+                        continue
+
+                    preview = self._preview_replacement_spread(replacement_short, candidate_replacement_hedge, quantity)
+                    logger.info(
+                        f"  Cycle {cycle_id}: replacement spread preview with hedge strike {candidate_strike:.0f} "
+                        f"(dist={candidate_h_dist}): {preview}"
+                    )
+
+                    if preview.get("can_trade", False):
+                        selected_hedge_row = candidate_hedge_row
+                        selected_replacement_hedge = candidate_replacement_hedge
+                        selected_preview = preview
+                        break
+                    else:
+                        logger.warning(
+                            f"  Cycle {cycle_id}: preview failed for hedge strike {candidate_strike:.0f} "
+                            f"(dist={candidate_h_dist}): {preview.get('reason')}. Trying next hedge distance..."
+                        )
+
+                if selected_replacement_hedge is None:
+                    logger.warning(
+                        f"  Cycle {cycle_id}: rejecting adjustment execution, all candidate replacement hedges failed preview"
+                    )
+                    results[cycle_id] = {
+                        "status": "adjustment_margin_check_failed",
+                        "reason": selected_preview.get("reason") if selected_preview else "no_valid_hedge_found",
+                        "current_delta": current_delta,
+                    }
+                    continue
+
+                hedge_row = selected_hedge_row
+                replacement_hedge = selected_replacement_hedge
 
                 logger.info(
                     f"  Cycle {cycle_id}: rolling {short_type} pair from {short_pos['strike']:.0f}/"
@@ -1241,34 +1378,15 @@ class PaperTrader:
                 )
 
                 closed_short = self._close_position(short_pos, option_chain, "delta_adjust")
+                time_module.sleep(5)
                 closed_hedge = self._close_position(hedge_pos, option_chain, "delta_adjust")
                 if closed_short is None or closed_hedge is None:
                     results[cycle_id] = {"status": "close_failed", "current_delta": current_delta}
                     continue
 
-                quantity = pos_data.get("quantity", 1)
-                replacement_short = self._position_from_row(new_short, "S", "SELL", short_type, quantity, cycle_id)
-                replacement_hedge = self._position_from_row(hedge_row, "B", "BUY", short_type, quantity, cycle_id)
-                if replacement_short is None or replacement_hedge is None:
-                    results[cycle_id] = {"status": "open_replacement_failed", "current_delta": current_delta}
-                    continue
-
-                # Preview replacement spread margin / what-if before submitting new orders
-                preview = self._preview_replacement_spread(replacement_short, replacement_hedge, quantity)
-                logger.info(f"  Cycle {cycle_id}: replacement spread margin preview: {preview}")
-                if not preview.get("can_trade", False):
-                    logger.warning(
-                        f"  Cycle {cycle_id}: rejecting adjustment execution, margin preview failed: {preview.get('reason')}"
-                    )
-                    results[cycle_id] = {
-                        "status": "adjustment_margin_check_failed",
-                        "reason": preview.get("reason"),
-                        "current_delta": current_delta,
-                    }
-                    continue
-
-                self._submit_new_position(replacement_short)
                 self._submit_new_position(replacement_hedge)
+                self._submit_new_position(replacement_short)
+                
                 pos_data["positions"].extend([replacement_short, replacement_hedge])
                 pos_data["adjustments"] = adjustments + 1
 

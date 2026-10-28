@@ -743,10 +743,14 @@ class IBKRConnectionManager:
                 if len(expiries) != 1:
                     raise ValueError("This preview expects a same-expiry package")
 
+                symbol = next(iter(symbols))
+                # SPX and SPXW options trade on CBOE; BAG combos and legs must specify CBOE or SMART appropriately
+                primary_exchange = "CBOE" if symbol in ("SPX", "NDX", "RUT") else "SMART"
+
                 combo = Contract()
-                combo.symbol = next(iter(symbols))
+                combo.symbol = symbol
                 combo.secType = "BAG"
-                combo.exchange = "SMART"
+                combo.exchange = primary_exchange
                 combo.currency = next(iter(currencies))
                 combo.comboLegs = []
 
@@ -765,15 +769,17 @@ class IBKRConnectionManager:
                     combo_leg.conId = con_id
                     combo_leg.ratio = ratio
                     combo_leg.action = leg_action
-                    combo_leg.exchange = "SMART"
+                    combo_leg.exchange = primary_exchange
                     combo.comboLegs.append(combo_leg)
 
                 order = Order()
                 order.account = account
                 order.action = "BUY"
                 order.totalQuantity = quantity
-                order.orderType = "LMT"
-                order.lmtPrice = float(net_price)  # Do not use abs().
+                # For what-if margin previews, MKT bypasses negative price rejection on combos
+                # while returning the accurate margin requirement from the margin engine.
+                order.orderType = "MKT"
+                order.overridePercentageConstraints = True
                 order.tif = "DAY"
                 order.whatIf = True
                 order.transmit = True
@@ -785,9 +791,73 @@ class IBKRConnectionManager:
                 with wrapper.margin_lock:
                     wrapper.what_if_events[order_id] = event
 
+                active_wrapper = getattr(client, "wrapper", None)
+
+                logger.info(
+                    "WHATIF_SEND orderId=%s "
+                    "wrapper=%s active_wrapper=%s "
+                    "connected=%s account=%s "
+                    "whatIf=%s transmit=%s "
+                    "exchange=%s action=%s quantity=%s price=%s",
+                    order_id,
+                    id(wrapper),
+                    id(active_wrapper),
+                    client.isConnected(),
+                    order.account,
+                    order.whatIf,
+                    order.transmit,
+                    combo.exchange,
+                    order.action,
+                    order.totalQuantity,
+                    getattr(order, "lmtPrice", 0.0),
+                )
+
+                if active_wrapper is not wrapper:
+                    raise RuntimeError(
+                        "The preview event was registered on a wrapper "
+                        "different from the client's active wrapper"
+                    )
+
+                logger.info(
+                    "WHATIF_LEGS orderId=%s legs=%r",
+                    order_id,
+                    [
+                        {
+                            "conId": leg.conId,
+                            "action": leg.action,
+                            "ratio": leg.ratio,
+                            "exchange": leg.exchange,
+                        }
+                        for leg in combo.comboLegs
+                    ],
+                )
+
+                started = time.monotonic()
+
                 client.placeOrder(order_id, combo, order)
+
+                logger.info(
+                    "WHATIF_DISPATCHED orderId=%s",
+                    order_id,
+                )
+
                 if not event.wait(timeout):
-                    raise TimeoutError("IBKR margin preview timed out")
+                    with wrapper.margin_lock:
+                        pending_ids = list(wrapper.what_if_events)
+                        stored_state_ids = list(wrapper.what_if_order_states)
+
+                    raise TimeoutError(
+                        f"IBKR margin preview timed out after "
+                        f"{time.monotonic() - started:.2f}s; "
+                        f"orderId={order_id}; "
+                        f"connected={client.isConnected()}; "
+                        f"api_thread_alive="
+                        f"{self.thread.is_alive() if self.thread else False}; "
+                        f"pending_ids={pending_ids}; "
+                        f"stored_state_ids={stored_state_ids}; "
+                        f"recent_errors={list(wrapper.errors)[-10:]!r}"
+                    )
+
 
                 with wrapper.margin_lock:
                     error = wrapper.request_errors.get(order_id)
