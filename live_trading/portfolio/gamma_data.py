@@ -79,8 +79,14 @@ def fetch_live_gamma_inputs(
         ib.qualifyContracts(spx)
 
         spot_ticker = ib.reqTickers(spx)[0]
-        spot = spot_ticker.last or spot_ticker.close
-        if not spot or spot <= 0:
+
+        def _positive(value):
+            return value is not None and np.isfinite(value) and value > 0
+
+        # Outside market hours `last` is NaN, which is truthy - check it
+        # explicitly so we fall back to the previous close.
+        spot = spot_ticker.last if _positive(spot_ticker.last) else spot_ticker.close
+        if not _positive(spot):
             raise RuntimeError(
                 "IBKR did not return an SPX spot price. Check the index "
                 "market-data subscription and the market data type."
@@ -108,6 +114,12 @@ def fetch_live_gamma_inputs(
             s for s in all_strikes
             if spot - strike_padding <= s <= spot + strike_padding
         ]
+        if not strikes:
+            raise RuntimeError(
+                f"No SPX strikes within +/-{strike_padding} points of spot "
+                f"{spot:.2f} on the {expiry_str} chain. Widen the strike "
+                "window or pick another expiry."
+            )
 
         calls = [Option("SPX", expiry_str, s, "C", "CBOE") for s in strikes]
         puts = [Option("SPX", expiry_str, s, "P", "CBOE") for s in strikes]
