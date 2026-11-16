@@ -235,10 +235,10 @@ def main():
                 ["Live", "Frozen", "Delayed", "Delayed-frozen"],
             )
             market_data_type = ["Live", "Frozen", "Delayed", "Delayed-frozen"].index(md_type_label) + 1
-            expiry = st.date_input("Expiry", value=date.today())
+            expiry = st.date_input("Expiry", value=datetime.now(ET).date())
         else:
             demo_spot = st.number_input("Demo spot", value=6650.0, step=25.0)
-            expiry = date.today()
+            expiry = datetime.now(ET).date()
 
         st.header("Model")
         rate_pct = st.number_input("Risk-free rate %", value=4.5, step=0.25)
