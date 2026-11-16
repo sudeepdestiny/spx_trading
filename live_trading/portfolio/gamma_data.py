@@ -78,18 +78,31 @@ def fetch_live_gamma_inputs(
         spx = Index("SPX", "CBOE")
         ib.qualifyContracts(spx)
 
-        spot_ticker = ib.reqTickers(spx)[0]
-
         def _positive(value):
             return value is not None and np.isfinite(value) and value > 0
 
-        # Outside market hours `last` is NaN, which is truthy - check it
-        # explicitly so we fall back to the previous close.
-        spot = spot_ticker.last if _positive(spot_ticker.last) else spot_ticker.close
+        # Stream and poll instead of a one-shot snapshot: outside market
+        # hours the data farms can take over ten seconds to wake, and a
+        # snapshot request ends empty before the first tick arrives.
+        spot_ticker = ib.reqMktData(spx, "", False, False)
+        spot = float("nan")
+        for _ in range(25):
+            ib.sleep(1)
+            # Outside market hours `last` is NaN, which is truthy - check
+            # it explicitly so we fall back to the previous close.
+            spot = (
+                spot_ticker.last
+                if _positive(spot_ticker.last)
+                else spot_ticker.close
+            )
+            if _positive(spot):
+                break
+        ib.cancelMktData(spx)
         if not _positive(spot):
             raise RuntimeError(
-                "IBKR did not return an SPX spot price. Check the index "
-                "market-data subscription and the market data type."
+                "IBKR did not return an SPX spot price after waiting. "
+                "Check the index market-data subscription and the market "
+                "data type."
             )
 
         chains = ib.reqSecDefOptParams(spx.symbol, "", spx.secType, spx.conId)
