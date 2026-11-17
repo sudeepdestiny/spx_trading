@@ -23,6 +23,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import List, Optional
+import re
 
 import numpy as np
 import pandas as pd
@@ -50,7 +51,7 @@ def fetch_live_gamma_inputs(
     port: int = 7497,
     client_id: int = 11,
     market_data_type: int = 1,
-    settle_seconds: float = 3.0,
+    settle_seconds: float = 10.0,
 ) -> GammaInputs:
     """
     Pull the SPX option chain with greeks and open interest from IBKR.
@@ -74,6 +75,24 @@ def fetch_live_gamma_inputs(
     try:
         ib.connect(host, port, clientId=client_id, timeout=10)
         ib.reqMarketDataType(market_data_type)
+
+        # Surface the broker's own messages (permission, farm and request
+        # errors) in the dashboard warnings instead of dropping them.
+        # Account-like identifiers are scrubbed and messages capped; the
+        # view renders warnings as plain markdown-escaped text.
+        broker_messages: List[str] = []
+        acctish = re.compile(r"\b[A-Za-z]{0,3}\d{6,}[A-Za-z0-9]*\b")
+
+        def _on_error(*args):
+            # ib_insync emits (reqId, errorCode, errorString[, contract]).
+            if len(args) >= 3:
+                msg = acctish.sub("[redacted]", str(args[2]))
+                msg = " ".join(msg.split())[:300]
+                text = f"IBKR {args[1]}: {msg}"
+                if text not in broker_messages:
+                    broker_messages.append(text)
+
+        ib.errorEvent += _on_error
 
         spx = Index("SPX", "CBOE")
         ib.qualifyContracts(spx)
@@ -197,6 +216,12 @@ def fetch_live_gamma_inputs(
             warnings.append(
                 "IBKR delivered no model IV. The dashboard will try to back "
                 "IV out of mid prices where possible."
+            )
+
+        if broker_messages:
+            warnings.append(
+                "Broker messages during the request: "
+                + " | ".join(broker_messages[:12])
             )
 
         return GammaInputs(
