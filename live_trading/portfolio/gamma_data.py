@@ -122,15 +122,16 @@ def _row_side_iv_ok(row, side, spot, t_years, rate=0.045) -> bool:
     )
 
 
-def _assess_completeness(df, all_qualified: bool, spot: float, t_years: float) -> bool:
+def _assess_completeness(df, all_qualified: bool, spot: float, t_years: float,
+                         rate: float = 0.045) -> bool:
     """Complete means: every requested contract qualified, and every strike
     has open interest AND a usable IV (model or solvable fallback) on BOTH
     sides. Nothing less certifies walls/flip/GEX."""
     if not all_qualified or df.empty:
         return False
     has_oi = df[["call_oi", "put_oi"]].notna().all(axis=1)
-    call_ok = df.apply(lambda r: _row_side_iv_ok(r, "call", spot, t_years), axis=1)
-    put_ok = df.apply(lambda r: _row_side_iv_ok(r, "put", spot, t_years), axis=1)
+    call_ok = df.apply(lambda r: _row_side_iv_ok(r, "call", spot, t_years, rate), axis=1)
+    put_ok = df.apply(lambda r: _row_side_iv_ok(r, "put", spot, t_years, rate), axis=1)
     return bool((has_oi & call_ok & put_ok).all())
 
 
@@ -148,6 +149,7 @@ def _select_strikes(all_strikes, spot: float, strike_count: int) -> list:
 def fetch_live_gamma_inputs(
     expiry: Optional[date] = None,
     strike_count: int = 20,
+    rate: float = 0.045,
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 11,
@@ -381,6 +383,7 @@ def fetch_live_gamma_inputs(
 
         complete = _assess_completeness(
             df, all_qualified, float(spot), _years_to_expiry(expiry_date),
+            rate=rate,
         )
 
         if broker_messages:
