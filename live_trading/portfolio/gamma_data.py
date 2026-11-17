@@ -21,7 +21,7 @@ Two sources:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime
 from zoneinfo import ZoneInfo
 from typing import List, Optional
 import re
@@ -63,6 +63,75 @@ def _ticker_inputs_delivered(ticker, right) -> bool:
     if ticker.modelGreeks is not None:
         return True
     return bool(ticker.bid > 0 and ticker.ask > 0)
+
+
+def _years_to_expiry(expiry: date, now_et: Optional[datetime] = None) -> float:
+    """Years until 16:00 ET on the expiry date (same convention as the view)."""
+    now_et = now_et or datetime.now(ZoneInfo("America/New_York"))
+    close_et = datetime.combine(expiry, dtime(16, 0), tzinfo=ZoneInfo("America/New_York"))
+    years = (close_et - now_et).total_seconds() / (365.0 * 24.0 * 3600.0)
+    return max(years, 1.0 / (365.0 * 24.0 * 60.0))  # one-minute floor
+
+
+def _side_fallback_price(row, side: str):
+    """The price the view's IV fallback would use: two-sided mid, else last."""
+    bid, ask, last = (row.get(f"{side}_{k}") for k in ("bid", "ask", "last"))
+    if (
+        bid is not None and pd.notna(bid) and bid > 0
+        and ask is not None and pd.notna(ask) and ask > 0
+    ):
+        return (bid + ask) / 2.0
+    if last is not None and pd.notna(last) and last > 0:
+        return last
+    return None
+
+
+def _iv_solvable(price, spot, strike, right, t_years, rate=0.045) -> bool:
+    """True when the view's mid/last-price IV inversion actually solves.
+
+    A quote existing is not enough: the bisection solver in gamma_exposure
+    returns None when the price falls outside the no-arbitrage bracket, and
+    those rows would silently lose GEX downstream. Lazy import keeps this
+    module usable without the exposure module's dependencies.
+    """
+    if price is None or not np.isfinite(price) or price <= 0:
+        return False
+    from live_trading.portfolio.gamma_exposure import implied_vol
+    try:
+        iv = implied_vol(
+            price=float(price), spot=float(spot), strike=float(strike),
+            time_to_expiry=t_years, rate=rate, option_type=right,
+        )
+    except Exception:
+        return False
+    return iv is not None and np.isfinite(iv) and iv > 0
+
+
+def _row_side_iv_ok(row, side, spot, t_years, rate=0.045) -> bool:
+    """One side of one strike is covered: model IV, or a fallback price the
+    IV solver can actually invert."""
+    iv = row.get(f"{side}_iv")
+    if iv is not None and pd.notna(iv):
+        return True
+    price = _side_fallback_price(row, side)
+    if price is None:
+        return False
+    return _iv_solvable(
+        price, spot, float(row["strike"]),
+        "C" if side == "call" else "P", t_years, rate,
+    )
+
+
+def _assess_completeness(df, all_qualified: bool, spot: float, t_years: float) -> bool:
+    """Complete means: every requested contract qualified, and every strike
+    has open interest AND a usable IV (model or solvable fallback) on BOTH
+    sides. Nothing less certifies walls/flip/GEX."""
+    if not all_qualified or df.empty:
+        return False
+    has_oi = df[["call_oi", "put_oi"]].notna().all(axis=1)
+    call_ok = df.apply(lambda r: _row_side_iv_ok(r, "call", spot, t_years), axis=1)
+    put_ok = df.apply(lambda r: _row_side_iv_ok(r, "put", spot, t_years), axis=1)
+    return bool((has_oi & call_ok & put_ok).all())
 
 
 def _select_strikes(all_strikes, spot: float, strike_count: int) -> list:
@@ -310,14 +379,9 @@ def fetch_live_gamma_inputs(
                 "IV out of mid prices where possible."
             )
 
-        has_oi = df[["call_oi", "put_oi"]].notna().all(axis=1)
-        has_mid = (
-            df[["call_bid", "call_ask", "put_bid", "put_ask"]] > 0
-        ).all(axis=1)
-        has_iv_or_mid = (
-            df[["call_iv", "put_iv"]].notna().all(axis=1) | has_mid
+        complete = _assess_completeness(
+            df, all_qualified, float(spot), _years_to_expiry(expiry_date),
         )
-        complete = bool(all_qualified and (has_oi & has_iv_or_mid).all())
 
         if broker_messages:
             warnings.append(
