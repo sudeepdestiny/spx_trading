@@ -228,7 +228,7 @@ def main():
 
         if source == "IBKR live":
             host = st.text_input("TWS / Gateway host", value="127.0.0.1")
-            port = st.number_input("Port", value=7497, step=1)
+            port = st.number_input("Port", value=4001, step=1)
             client_id = st.number_input("Client ID", value=11, step=1)
             md_type_label = st.selectbox(
                 "Market data type",
