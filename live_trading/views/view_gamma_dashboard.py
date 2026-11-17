@@ -266,6 +266,7 @@ def main():
                 inputs = fetch_live_gamma_inputs(
                     expiry=expiry,
                     strike_count=int(strike_count),
+                    rate=rate_pct / 100.0,
                     host=host,
                     port=int(port),
                     client_id=int(client_id),
@@ -303,21 +304,33 @@ def main():
     for message in inputs.warnings:
         st.warning(message)
 
-    if inputs.source == "ibkr" and not inputs.complete:
-        st.error(
-            "Data coverage is incomplete: IBKR did not deliver open "
-            "interest and model greeks for every strike in the window, so "
-            "the walls, flip and GEX are withheld instead of computed from "
-            "partial data. Press Load / refresh to retry, or narrow the "
-            "strike window."
-        )
-        st.stop()
-
     now_et = datetime.now(ET)
     t = time_to_expiry_years(inputs.expiry, now_et)
     rate = rate_pct / 100.0
 
     chain = fill_missing_iv(inputs.chain, inputs.spot, rate, t)
+
+    if inputs.source == "ibkr":
+        # Final eligibility is assessed here, after the IV fallback ran at
+        # the actual selected rate: a strike counts only with OI and a
+        # solved IV on BOTH sides. inputs.complete (certified at fetch time
+        # with the same rate) must also hold for qualification coverage.
+        fully_covered = bool(
+            inputs.complete
+            and len(chain) > 0
+            and chain[["call_oi", "put_oi"]].notna().all(axis=1).all()
+            and chain[["call_iv", "put_iv"]].notna().all(axis=1).all()
+        )
+        if not fully_covered:
+            st.error(
+                "Data coverage is incomplete: IBKR did not deliver open "
+                "interest plus a usable IV (model greeks, or a price that "
+                "yields one at the selected rate) for every strike in the "
+                "window, so the walls, flip and GEX are withheld instead of "
+                "computed from partial data. Press Load / refresh to retry, "
+                "or narrow the strike window."
+            )
+            st.stop()
 
     usable_iv = chain[["call_iv", "put_iv"]].notna().any(axis=1)
     usable_oi = chain[["call_oi", "put_oi"]].notna().any(axis=1)
