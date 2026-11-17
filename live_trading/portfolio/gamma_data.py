@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import List, Optional
 import re
 
@@ -38,20 +39,52 @@ class GammaInputs:
     fetched_at: datetime
     market_data_type: Optional[str] = None   # e.g. "live", "delayed-frozen"
     warnings: List[str] = field(default_factory=list)
+    complete: bool = True   # False when any requested strike lacks OI or IV
 
 
 # ---------------------------------------------------------------------------
 # Live IBKR provider
 # ---------------------------------------------------------------------------
 
+def _ticker_inputs_delivered(ticker, right) -> bool:
+    """True when a streaming ticker has delivered everything the dashboard
+    needs for its side of one strike.
+
+    ib_insync leaves option open interest at NaN until the tickSize 27/28
+    event arrives (wrapper.py assigns the raw value), so NaN means "never
+    delivered" and a genuine delivered 0 still counts as delivered.
+    modelGreeks stays None until a tickOptionComputation event arrives.
+    When model greeks are absent, a two-sided quote is enough: the view
+    backs IV out of the mid price as a fallback.
+    """
+    oi = ticker.callOpenInterest if right == "C" else ticker.putOpenInterest
+    if oi != oi:   # NaN: OI tick never arrived
+        return False
+    if ticker.modelGreeks is not None:
+        return True
+    return bool(ticker.bid > 0 and ticker.ask > 0)
+
+
+def _select_strikes(all_strikes, spot: float, strike_count: int) -> list:
+    """Return strike_count levels below/above the strike nearest spot."""
+    nearest = min(
+        range(len(all_strikes)),
+        key=lambda i: abs(all_strikes[i] - spot),
+    )
+    lo = max(0, nearest - strike_count)
+    hi = min(len(all_strikes), nearest + strike_count + 1)
+    return list(all_strikes[lo:hi])
+
+
 def fetch_live_gamma_inputs(
     expiry: Optional[date] = None,
-    strike_padding: int = 300,
+    strike_count: int = 20,
     host: str = "127.0.0.1",
     port: int = 7497,
     client_id: int = 11,
     market_data_type: int = 1,
-    settle_seconds: float = 10.0,
+    max_wait_seconds: float = 30.0,
+    strikes: Optional[List[float]] = None,
 ) -> GammaInputs:
     """
     Pull the SPX option chain with greeks and open interest from IBKR.
@@ -142,16 +175,21 @@ def fetch_live_gamma_inputs(
         expiry_date = datetime.strptime(expiry_str, "%Y%m%d").date()
 
         all_strikes = sorted(chain_def.strikes)
-        strikes = [
-            s for s in all_strikes
-            if spot - strike_padding <= s <= spot + strike_padding
-        ]
-        if not strikes:
-            raise RuntimeError(
-                f"No SPX strikes within +/-{strike_padding} points of spot "
-                f"{spot:.2f} on the {expiry_str} chain. Widen the strike "
-                "window or pick another expiry."
-            )
+        if strikes is None:
+            strikes = _select_strikes(all_strikes, spot, strike_count)
+            if not strikes:
+                raise RuntimeError(
+                    f"No SPX strikes around spot {spot:.2f} on the "
+                    f"{expiry_str} chain."
+                )
+        else:
+            unknown = [s for s in strikes if s not in all_strikes]
+            if unknown:
+                raise RuntimeError(
+                    f"Strikes {unknown} are not listed on the {expiry_str} "
+                    "SPX chain."
+                )
+            strikes = sorted(strikes)
 
         # The trading class is required: bare "SPX" options on CBOE are
         # ambiguous between classes (SPXW, SPXO, SPX) and IBKR rejects the
@@ -167,8 +205,10 @@ def fetch_live_gamma_inputs(
             for s in strikes
         ]
         contracts = calls + puts
+        requested_count = len(contracts)
         qualified = ib.qualifyContracts(*contracts)
-        if len(qualified) < len(contracts):
+        all_qualified = len(qualified) == requested_count
+        if not all_qualified:
             warnings.append(
                 f"IBKR did not qualify {len(contracts) - len(qualified)} of "
                 f"{len(contracts)} option contracts; those strikes are "
@@ -191,12 +231,32 @@ def fetch_live_gamma_inputs(
 
         # Generic ticks: 100 = option volume, 101 = option open interest.
         # Open interest is only delivered on streaming requests.
-        tickers = [
-            ib.reqMktData(c, "100,101", False, False) for c in contracts
-        ]
-        ib.sleep(settle_seconds)
-        for c in contracts:
-            ib.cancelMktData(c)
+        # Request in batches under the account's simultaneous-ticker cap:
+        # streaming more contracts than the cap rejects the excess with
+        # error 101 ("max number of tickers"), silently dropping strikes.
+        batch_size = 80
+        tickers = []
+        for start in range(0, len(contracts), batch_size):
+            batch = contracts[start:start + batch_size]
+            batch_tickers = [
+                ib.reqMktData(c, "100,101", False, False) for c in batch
+            ]
+            # Poll until every ticker has delivered its required inputs,
+            # up to max_wait_seconds per batch. The cap is not a promise:
+            # anything still missing stays NaN/None (never zero) and marks
+            # the run incomplete below.
+            waited = 0.0
+            while waited < max_wait_seconds:
+                ib.sleep(0.5)
+                waited += 0.5
+                if all(
+                    _ticker_inputs_delivered(t, c.right)
+                    for t, c in zip(batch_tickers, batch)
+                ):
+                    break
+            for c in batch:
+                ib.cancelMktData(c)
+            tickers.extend(batch_tickers)
 
         def _usable(value):
             return value is not None and np.isfinite(value) and value >= 0
@@ -239,8 +299,9 @@ def fetch_live_gamma_inputs(
             )
         elif df[["call_oi", "put_oi"]].isna().any().any():
             warnings.append(
-                "Open interest is missing for some strikes; those strikes "
-                "are excluded from the walls and GEX, not treated as zero."
+                "Open interest is missing for some strikes; the walls, "
+                "flip and GEX are withheld rather than computed from "
+                "partial data. Missing values are never treated as zero."
             )
 
         if df["call_iv"].isna().all() and df["put_iv"].isna().all():
@@ -248,6 +309,15 @@ def fetch_live_gamma_inputs(
                 "IBKR delivered no model IV. The dashboard will try to back "
                 "IV out of mid prices where possible."
             )
+
+        has_oi = df[["call_oi", "put_oi"]].notna().all(axis=1)
+        has_mid = (
+            df[["call_bid", "call_ask", "put_bid", "put_ask"]] > 0
+        ).all(axis=1)
+        has_iv_or_mid = (
+            df[["call_iv", "put_iv"]].notna().all(axis=1) | has_mid
+        )
+        complete = bool(all_qualified and (has_oi & has_iv_or_mid).all())
 
         if broker_messages:
             warnings.append(
@@ -260,9 +330,10 @@ def fetch_live_gamma_inputs(
             spot=float(spot),
             expiry=expiry_date,
             source="ibkr",
-            fetched_at=datetime.now(),
+            fetched_at=datetime.now(ZoneInfo("America/New_York")),
             market_data_type=md_type_names.get(market_data_type, str(market_data_type)),
             warnings=warnings,
+            complete=complete,
         )
     finally:
         ib.disconnect()
@@ -274,7 +345,7 @@ def fetch_live_gamma_inputs(
 
 def make_demo_chain(
     spot: float = 6650.0,
-    strike_padding: int = 300,
+    strike_count: int = 20,
     expiry: Optional[date] = None,
     seed: int = 7,
 ) -> GammaInputs:
@@ -288,8 +359,8 @@ def make_demo_chain(
         expiry = date.today()
 
     strikes = np.arange(
-        round(spot - strike_padding),
-        round(spot + strike_padding) + 5,
+        round(spot / 5) * 5 - strike_count * 5,
+        round(spot / 5) * 5 + strike_count * 5 + 5,
         5.0,
     )
 
