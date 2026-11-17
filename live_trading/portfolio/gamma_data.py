@@ -153,10 +153,41 @@ def fetch_live_gamma_inputs(
                 "window or pick another expiry."
             )
 
-        calls = [Option("SPX", expiry_str, s, "C", "CBOE") for s in strikes]
-        puts = [Option("SPX", expiry_str, s, "P", "CBOE") for s in strikes]
+        # The trading class is required: bare "SPX" options on CBOE are
+        # ambiguous between classes (SPXW, SPXO, SPX) and IBKR rejects the
+        # requests with error 200, so qualify by the chain's own class.
+        calls = [
+            Option("SPX", expiry_str, s, "C", "CBOE",
+                   currency="USD", tradingClass=chain_def.tradingClass)
+            for s in strikes
+        ]
+        puts = [
+            Option("SPX", expiry_str, s, "P", "CBOE",
+                   currency="USD", tradingClass=chain_def.tradingClass)
+            for s in strikes
+        ]
         contracts = calls + puts
-        ib.qualifyContracts(*contracts)
+        qualified = ib.qualifyContracts(*contracts)
+        if len(qualified) < len(contracts):
+            warnings.append(
+                f"IBKR did not qualify {len(contracts) - len(qualified)} of "
+                f"{len(contracts)} option contracts; those strikes are "
+                "excluded, not treated as zero."
+            )
+        by_key = {(c.right, c.strike): c for c in qualified}
+        strikes = sorted(
+            {c.strike for c in qualified if c.right == "C"}
+            & {c.strike for c in qualified if c.right == "P"}
+        )
+        if not strikes:
+            raise RuntimeError(
+                "IBKR did not qualify any usable SPX option contracts for "
+                f"trading class {chain_def.tradingClass} expiry {expiry_str}."
+            )
+        contracts = (
+            [by_key[("C", s)] for s in strikes]
+            + [by_key[("P", s)] for s in strikes]
+        )
 
         # Generic ticks: 100 = option volume, 101 = option open interest.
         # Open interest is only delivered on streaming requests.
