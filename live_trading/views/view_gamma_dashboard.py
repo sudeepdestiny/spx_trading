@@ -217,13 +217,13 @@ def main():
         source = st.radio(
             "Source",
             ["Demo (synthetic preview)", "IBKR live"],
-            index=0,
+            index=1,
             help="Demo uses invented numbers so you can review the layout "
                  "without a broker connection.",
         )
 
-        strike_padding = st.number_input(
-            "Strike window ± points", value=300, min_value=100, step=50,
+        strike_count = st.number_input(
+            "Strike levels each side of spot", value=20, min_value=5, step=5,
         )
 
         if source == "IBKR live":
@@ -265,7 +265,7 @@ def main():
             if source == "IBKR live":
                 inputs = fetch_live_gamma_inputs(
                     expiry=expiry,
-                    strike_padding=int(strike_padding),
+                    strike_count=int(strike_count),
                     host=host,
                     port=int(port),
                     client_id=int(client_id),
@@ -274,7 +274,7 @@ def main():
             else:
                 inputs = make_demo_chain(
                     spot=float(demo_spot),
-                    strike_padding=int(strike_padding),
+                    strike_count=int(strike_count),
                     expiry=expiry,
                 )
             st.session_state[cache_key] = inputs
@@ -294,13 +294,24 @@ def main():
     else:
         st.caption(
             f"IBKR {inputs.market_data_type} data, pulled "
-            f"{inputs.fetched_at:%Y-%m-%d %H:%M:%S}. Open interest is the "
+            f"{inputs.fetched_at:%Y-%m-%d %H:%M:%S} ET (request time, not "
+            "necessarily the last quote time). Open interest is the "
             "latest value the exchange published (updated once per session), "
             "not live intraday positioning."
         )
 
     for message in inputs.warnings:
         st.warning(message)
+
+    if inputs.source == "ibkr" and not inputs.complete:
+        st.error(
+            "Data coverage is incomplete: IBKR did not deliver open "
+            "interest and model greeks for every strike in the window, so "
+            "the walls, flip and GEX are withheld instead of computed from "
+            "partial data. Press Load / refresh to retry, or narrow the "
+            "strike window."
+        )
+        st.stop()
 
     now_et = datetime.now(ET)
     t = time_to_expiry_years(inputs.expiry, now_et)
