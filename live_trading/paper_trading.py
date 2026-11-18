@@ -124,6 +124,9 @@ class PaperTrader:
                     "quantity": quantity,
                     "price": inferred_price,
                     "entry_price": inferred_price,
+                    # Broker-reported average cost; may not equal the raw fill
+                    # prices (exact composition is not verified here).
+                    "entry_price_source": "ibkr_avg_cost",
                     "delta": 0.0, 
                     "order_id": None,
                     "status": "OPEN",
@@ -142,6 +145,10 @@ class PaperTrader:
             }
             new_cycles_added += 1
             logger.info(f"  Reconstructed Cycle {new_cycle_id} from IBKR with {len(cycle_legs)} legs for {symbol} {expiry}")
+            logger.info(
+                f"  Cycle {new_cycle_id} entry basis is IBKR-reported avgCost, "
+                "which may differ from raw fills; cycle P&L and stop-loss are measured against that basis"
+            )
 
         return new_cycles_added > 0
 
@@ -751,24 +758,109 @@ class PaperTrader:
         client.placeOrder(order_id, contract, order)
         return order_id
 
-    def _option_price(self, row, option_type, side):
+    def _option_price_with_source(self, row, option_type, side):
+        """
+        Price an option leg from a chain row and report where the price came from.
+
+        Returns:
+            (price, source) where source is one of "bid", "ask", "mid",
+            "model_price", "last" or "intrinsic_floor". (None, None) if no
+            usable price exists.
+        """
         prefix = "call" if option_type == "CE" else "put"
         preferred = f"{prefix}_bid" if side == "S" else f"{prefix}_ask"
-        
+        preferred_label = "bid" if side == "S" else "ask"
+
         # Try standard market data columns
-        for column in (preferred, f"{prefix}_mid", f"{prefix}_model_price", f"{prefix}_last"):
+        for column, label in (
+            (preferred, preferred_label),
+            (f"{prefix}_mid", "mid"),
+            (f"{prefix}_model_price", "model_price"),
+            (f"{prefix}_last", "last"),
+        ):
             if column in row.index and pd.notna(row[column]) and float(row[column]) > 0:
-                return round(float(row[column]), 2)
-        
+                return round(float(row[column]), 2), label
+
         # Fallback: Calculate intrinsic value + small floor if market data is missing
         # This prevents closing logic from failing due to missing quotes
         if "spot_price" in row.index and "strike" in row.index:
             spot = float(row["spot_price"])
             strike = float(row["strike"])
             intrinsic = max(0, spot - strike) if option_type == "CE" else max(0, strike - spot)
-            return round(max(0.05, intrinsic), 2)
-            
+            return round(max(0.05, intrinsic), 2), "intrinsic_floor"
+
+        return None, None
+
+    def _option_price(self, row, option_type, side):
+        price, _source = self._option_price_with_source(row, option_type, side)
+        return price
+
+    def _fill_price_for_order(self, order_id):
+        """
+        Return the average fill price IBKR reported for a COMPLETELY filled
+        order, or None. Reads the wrapper's filled_orders, which is populated
+        by orderStatus callbacks. Status "Filled" means fully filled; partial
+        fills, cancelled remainder and unconfirmed orders all return None.
+        """
+        if order_id is None:
+            return None
+        wrapper = self.conn_mgr.get_wrapper()
+        if wrapper is None:
+            return None
+        info = getattr(wrapper, "filled_orders", {}).get(order_id, {})
+        if info.get("status") == "Filled":
+            avg_price = info.get("avg_price")
+            if avg_price is not None and float(avg_price) > 0:
+                # Full broker precision is kept internally; display rounds.
+                return float(avg_price)
         return None
+
+    def _refresh_entries_from_fills(self, positions):
+        """
+        Opportunistically rebase quote-based entries onto completed fills.
+
+        Pure lookup in the wrapper's already-received order statuses: no
+        waiting, no requests, no timing change. Lets legs whose fill was
+        unconfirmed at placement time (including late fills) pick up their
+        actual entry price on a later monitoring pass. Idempotent: legs
+        already on a fill or broker basis are left alone.
+        """
+        for pos in positions:
+            if pos.get("status") == "CLOSED":
+                continue
+            if pos.get("entry_price_source") != "selection_quote":
+                continue
+            if self._fill_price_for_order(pos.get("order_id")) is None:
+                continue
+            if self._apply_entry_fill(pos, pos.get("order_id")):
+                logger.info(
+                    f"    Late fill applied for {pos['type']} {pos['strike']:.0f} "
+                    f"(order_id={pos.get('order_id')})"
+                )
+
+    def _apply_entry_fill(self, pos, order_id):
+        """
+        Rebase a position's entry price on the actual IBKR fill. Keeps the
+        selection-time quote in quote_at_selection. Returns True when a fill
+        price was applied.
+        """
+        fill_price = self._fill_price_for_order(order_id)
+        if fill_price is None:
+            pos.setdefault("entry_price_source", "selection_quote")
+            logger.warning(
+                f"    Fill price unconfirmed for order_id={order_id}; "
+                f"entry basis stays {pos['entry_price']:.2f} ({pos['entry_price_source']})"
+            )
+            return False
+        pos["quote_at_selection"] = pos.get("quote_at_selection", pos["price"])
+        pos["price"] = fill_price
+        pos["entry_price"] = fill_price
+        pos["entry_price_source"] = "ibkr_fill"
+        logger.info(
+            f"    Fill confirmed for order_id={order_id}: avg_fill={fill_price:.2f} "
+            f"(selection quote was {pos['quote_at_selection']:.2f})"
+        )
+        return True
 
     def _find_hedge_row(self, chain, short_strike, option_type, hedge_dist, log_fallback=True):
         price_col = "call_mid" if option_type == "CE" else "put_mid"
@@ -924,6 +1016,9 @@ class PaperTrader:
                         "quantity": int(quantity),
                         "price": price,
                         "entry_price": price,
+                        # Selection-time quote; replaced by the actual fill once confirmed.
+                        "quote_at_selection": price,
+                        "entry_price_source": "selection_quote",
                         "delta": delta,
                         "order_id": None,
                         "status": "PENDING_SUBMIT" if submit_orders else "DRY_RUN",
@@ -982,6 +1077,7 @@ class PaperTrader:
                         return []
                     hedge_ids.append(oid)
                     pos["status"] = "FILLED"
+                    self._apply_entry_fill(pos, oid)
                     
             # Step 2: Only place shorts after hedges are confirmed filled
             for pos in short_orders:
@@ -992,7 +1088,14 @@ class PaperTrader:
                     pos["status"] = "SUBMITTED"
                     logger.info(f"    Submitted IBKR order_id={oid}")
                     
-                    self.conn_mgr.wait_for_fill(oid, timeout=10.0)
+                    filled = self.conn_mgr.wait_for_fill(oid, timeout=10.0)
+                    if filled:
+                        self._apply_entry_fill(pos, oid)
+                    else:
+                        logger.warning(
+                            f"Short leg {oid} not confirmed filled within timeout; "
+                            f"entry basis stays {pos['entry_price']:.2f} ({pos['entry_price_source']})"
+                        )
                     pos["status"] = "FILLED"
 
             self.live_positions[self.cycle_id] = {
@@ -1077,18 +1180,25 @@ class PaperTrader:
                 total_pnl += float(pos.get("pnl", 0.0))
                 continue
 
-            # Estimate open leg current value
+            # Estimate open leg current value at the price needed to close it:
+            # shorts are marked at the ask (cost to buy back), longs at the bid.
             row = self._find_chain_row(option_chain, pos["strike"])
             close_side = "B" if pos["side"] == "S" else "S"
             curr_price = None
+            curr_source = None
             if row is not None:
-                curr_price = self._option_price(row, pos["type"], close_side)
+                curr_price, curr_source = self._option_price_with_source(row, pos["type"], close_side)
 
             if curr_price is None:
                 curr_price = entry_price
+                curr_source = "entry_price_fallback"
 
+            entry_source = pos.get("entry_price_source", "unknown")
             leg_pnl = (entry_price - curr_price) * lot_size * quantity if pos["side"] == "S" else (curr_price - entry_price) * lot_size * quantity
-            logger.info(f"  Leg {pos['type']} {pos['strike']:.0f}: entry_price={entry_price:.2f}, curr_price={curr_price:.2f}, leg_pnl={leg_pnl:.2f}")
+            logger.info(
+                f"  Leg {pos['type']} {pos['strike']:.0f}: entry_price={entry_price:.2f} (source={entry_source}), "
+                f"curr_price={curr_price:.2f} (source={curr_source}), leg_pnl={leg_pnl:.2f}"
+            )
             total_pnl += leg_pnl
 
         return total_pnl
@@ -1157,6 +1267,8 @@ class PaperTrader:
             "quantity": int(quantity),
             "price": price,
             "entry_price": price,
+            "quote_at_selection": price,
+            "entry_price_source": "selection_quote",
             "delta": float(row[delta_col]),
             "order_id": None,
             "status": "PENDING_SUBMIT",
@@ -1171,7 +1283,7 @@ class PaperTrader:
             logger.warning(f"Cannot close {pos['type']} {pos['strike']:.0f}: missing chain row")
             return None
 
-        close_price = self._option_price(row, pos["type"], close_side)
+        close_price, close_price_source = self._option_price_with_source(row, pos["type"], close_side)
         if close_price is None:
             logger.warning(f"Cannot close {pos['type']} {pos['strike']:.0f}: missing close price")
             return None
@@ -1182,6 +1294,10 @@ class PaperTrader:
         close_order["price"] = close_price
         order_id = self._place_option_order(close_order, int(pos.get("quantity", 1)))
 
+        # NOTE: realized P&L below is booked from the pre-order quote, NOT the
+        # actual fill (the close order's fill is not awaited here). The source
+        # label makes that estimate explicit; using real close fills is an open
+        # decision kept out of this patch.
         multiplier = self.strategy.config.get("lot_size", 100)
         entry_price = float(pos.get("entry_price", pos.get("price", 0)))
         pnl = (entry_price - close_price) * multiplier if pos["side"] == "S" else (close_price - entry_price) * multiplier
@@ -1190,10 +1306,14 @@ class PaperTrader:
         pos["close_time"] = pd.Timestamp.now()
         pos["close_reason"] = reason
         pos["close_price"] = close_price
+        pos["close_price_source"] = close_price_source
         pos["close_order_id"] = order_id
         pos["pnl"] = pnl
 
-        logger.info(f"  Closing: {close_action} {pos['quantity']} {pos['type']} {pos['strike']:.0f} @ {close_price:.2f} order_id={order_id}")
+        logger.info(
+            f"  Closing: {close_action} {pos['quantity']} {pos['type']} {pos['strike']:.0f} "
+            f"@ {close_price:.2f} (source={close_price_source}, pre-order quote estimate) order_id={order_id}"
+        )
         return pos
 
     def _submit_new_position(self, pos):
@@ -1201,6 +1321,8 @@ class PaperTrader:
         pos["order_id"] = order_id
         pos["status"] = "SUBMITTED"
         logger.info(f"  Opening adjustment: {pos['action']} {pos['quantity']} {pos['type']} {pos['strike']:.0f} @ {pos['price']:.2f} order_id={order_id}")
+        # No fill wait here (unchanged behavior): if the order completes, the
+        # next monitoring pass rebases the entry via _refresh_entries_from_fills.
         return pos
     
     
@@ -1227,6 +1349,9 @@ class PaperTrader:
                 
                 logger.info(f"Monitoring cycle {cycle_id} ({len(pos_data['positions'])} legs)...")
 
+                # Rebase any quote-based entries onto completed fills (lookup only).
+                self._refresh_entries_from_fills(pos_data["positions"])
+
                 current_delta = self._calculate_current_portfolio_delta(option_chain, pos_data["positions"])
                 pos_delta_thresh = self.strategy.config.get("pos_delta_thresh", 0.25)
                 max_adjusts = self.strategy.config.get("max_adjusts", 3)
@@ -1237,7 +1362,8 @@ class PaperTrader:
                 if max_loss_stop_loss is not None:
                     current_cycle_pnl = self._calculate_current_cycle_pnl(option_chain, pos_data)
                     logger.info(
-                        f"  Cycle {cycle_id}: current_pnl=${current_cycle_pnl:.2f}, "
+                        f"  Cycle {cycle_id}: current_pnl=${current_cycle_pnl:.2f} "
+                        "(estimated valuation; per-leg price sources in the leg lines above), "
                         f"stop_loss_limit=-${max_loss_stop_loss:.2f}"
                     )
                     if current_cycle_pnl <= -abs(float(max_loss_stop_loss)):
@@ -1554,7 +1680,8 @@ class PaperTrader:
                         details_str.append(
                             f"    - {leg['action']} {leg['quantity']} {leg['type']} "
                             f"{leg['strike']:.0f} {leg['expiry']} @ {leg['price']:.2f} "
-                            f"(delta={leg['delta']:.3f}, order_id={leg['order_id']})"
+                            f"(entry_source={leg.get('entry_price_source', 'unknown')}, "
+                            f"delta={leg['delta']:.3f}, order_id={leg['order_id']})"
                         )
                 details_str.append("-" * (len(f"--- Cycle ID: {cycle_id} ---")))
 
