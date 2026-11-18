@@ -40,6 +40,10 @@ class GammaInputs:
     market_data_type: Optional[str] = None   # e.g. "live", "delayed-frozen"
     warnings: List[str] = field(default_factory=list)
     complete: bool = True   # False when any requested strike lacks OI or IV
+    vix: Optional[float] = None        # VIX level from the same feed; None when not delivered
+    vix_basis: Optional[str] = None    # "quote" (last index value) or "previous-close"
+    vix_time: Optional[datetime] = None  # feed quote time when IBKR supplies one
+    vix_md_type: Optional[str] = None  # actual market-data type IBKR reports for the ticker
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +232,55 @@ def fetch_live_gamma_inputs(
                 "data type."
             )
 
+        # VIX level, supplementary to the gamma inputs: same connection as
+        # the SPX chain. The basis ("quote" vs "previous-close"), the feed's
+        # quote time and the actual market-data type IBKR reports for the
+        # ticker are kept so the view can label the value honestly; a
+        # previous close is never presented as current, and when the actual
+        # type is not reported the view says "requested", never "live".
+        # Any failure here only marks VIX unavailable - it never fails the
+        # load.
+        vix_value = None
+        vix_basis = None
+        vix_time = None
+        vix_md_type = None
+        try:
+            vix_contract = Index("VIX", "CBOE")
+            ib.qualifyContracts(vix_contract)
+            vix_ticker = ib.reqMktData(vix_contract, "", False, False)
+            for _ in range(8):
+                ib.sleep(1)
+                if _positive(vix_ticker.last):
+                    vix_value = float(vix_ticker.last)
+                    vix_basis = "quote"
+                    break
+                if _positive(vix_ticker.close):
+                    vix_value = float(vix_ticker.close)
+                    vix_basis = "previous-close"
+                    break
+            if vix_value is not None:
+                feed_time = getattr(vix_ticker, "time", None)
+                if isinstance(feed_time, datetime):
+                    vix_time = feed_time
+                try:
+                    vix_md_type = md_type_names.get(
+                        int(getattr(vix_ticker, "marketDataType", None))
+                    )
+                except (TypeError, ValueError):
+                    vix_md_type = None
+            ib.cancelMktData(vix_contract)
+        except Exception:
+            vix_value = None
+            vix_basis = None
+            vix_time = None
+            vix_md_type = None
+        if vix_value is None:
+            warnings.append(
+                "IBKR did not deliver a VIX level (the account may lack the "
+                "CBOE index data permission, or the feed may be quiet). VIX "
+                "is shown as unavailable; the gamma levels are unaffected."
+            )
+
         chains = ib.reqSecDefOptParams(spx.symbol, "", spx.secType, spx.conId)
         chain_def = next((c for c in chains if c.exchange == "CBOE"), None)
         if chain_def is None:
@@ -401,6 +454,10 @@ def fetch_live_gamma_inputs(
             market_data_type=md_type_names.get(market_data_type, str(market_data_type)),
             warnings=warnings,
             complete=complete,
+            vix=vix_value,
+            vix_basis=vix_basis,
+            vix_time=vix_time,
+            vix_md_type=vix_md_type,
         )
     finally:
         ib.disconnect()
@@ -480,6 +537,9 @@ def make_demo_chain(
         source="demo",
         fetched_at=datetime.now(),
         market_data_type=None,
+        vix=float(np.clip(16.0 + rng.uniform(-4, 4), 9.0, 60.0)),
+        vix_basis="quote",
+        vix_time=datetime.now(),
         warnings=[
             "Demo mode: every value on this page is synthetic preview data, "
             "not from IBKR and not market data."
