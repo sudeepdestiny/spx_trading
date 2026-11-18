@@ -362,11 +362,47 @@ def main():
         dealer_calls_long=dealer_calls_long,
     )
 
-    cols = st.columns(5)
+    vix_value = getattr(inputs, "vix", None)
+    vix_basis = getattr(inputs, "vix_basis", None)
+    vix_time = getattr(inputs, "vix_time", None)
+    vix_md_actual = getattr(inputs, "vix_md_type", None)
+
+    def _md_suffix(md_name):
+        return {
+            "live": "",
+            "delayed": " (delayed)",
+            "delayed-frozen": " (delayed)",
+            "frozen": " (frozen)",
+        }.get(md_name, "")
+
+    if vix_value is None:
+        vix_label, vix_text = "VIX", "unavailable"
+    elif vix_basis == "previous-close":
+        vix_label, vix_text = "VIX (previous close)", f"{vix_value:,.2f}"
+    elif vix_md_actual:
+        vix_label, vix_text = "VIX" + _md_suffix(vix_md_actual), f"{vix_value:,.2f}"
+    else:
+        vix_label = f"VIX (requested {inputs.market_data_type or 'live'})"
+        vix_text = f"{vix_value:,.2f}"
+
+    cols = st.columns(6)
     cols[0].metric("SPX spot", f"{inputs.spot:,.2f}")
-    cols[1].metric("Call wall", format_level(walls.call_wall))
-    cols[2].metric("Put wall", format_level(walls.put_wall))
-    cols[3].metric(
+    cols[1].metric(
+        vix_label,
+        vix_text,
+        help="VIX index level from the same IBKR connection as the SPX "
+             "chain. The label says whether it is the previous session's "
+             "close, a quote whose data type IBKR reported (live, delayed "
+             "or frozen), or a quote labeled with only the requested type "
+             "when IBKR did not report the actual one - in that case live "
+             "freshness is unverified. The caption below gives the feed's "
+             "quote time when supplied. 'unavailable' means IBKR did not "
+             "deliver it (for example a missing index data permission); "
+             "the gamma levels are unaffected.",
+    )
+    cols[2].metric("Call wall", format_level(walls.call_wall))
+    cols[3].metric("Put wall", format_level(walls.put_wall))
+    cols[4].metric(
         "Gamma flip",
         format_level(flip.flip),
         help="Spot level where total signed GEX crosses zero, found by "
@@ -377,7 +413,38 @@ def main():
         "—" if flip.flip is None
         else "above flip" if inputs.spot > flip.flip else "below flip"
     )
-    cols[4].metric("Spot vs flip", spot_vs_flip)
+    cols[5].metric("Spot vs flip", spot_vs_flip)
+
+    if vix_value is not None:
+        if inputs.source == "demo":
+            vix_note = "VIX shown is synthetic demo data."
+        else:
+            if vix_basis == "previous-close":
+                vix_note = "VIX is the previous session's close, not a live quote."
+            elif vix_md_actual:
+                vix_note = (
+                    f"VIX is a {vix_md_actual} quote, as reported by IBKR "
+                    "for this ticker."
+                )
+            else:
+                vix_note = (
+                    "VIX is a quote fetched with the requested market-data "
+                    f"type '{inputs.market_data_type or 'live'}'; IBKR did "
+                    "not report this ticker's actual type, so live "
+                    "freshness is unverified."
+                )
+            if vix_time is not None:
+                vix_note += f" Feed quote time: {vix_time:%Y-%m-%d %H:%M:%S}"
+                if vix_time.tzinfo is None:
+                    vix_note += " (timezone not supplied by the feed)"
+                else:
+                    vix_note += f" {vix_time.strftime('%Z') or ''}".rstrip()
+            else:
+                vix_note += (
+                    " The feed supplied no quote time; the pulled-at time "
+                    "above is the request time."
+                )
+        st.caption(vix_note)
 
     if len(flip.crossings) > 1:
         st.caption(
