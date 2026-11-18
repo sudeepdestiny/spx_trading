@@ -360,7 +360,7 @@ class PaperTrader:
                     return pd.DataFrame()
 
             strike_step = 5
-            strike_count = 45
+            strike_count = 60 
             atm_strike = int(round(float(spot_price) / strike_step) * strike_step)
             low = atm_strike - (strike_count * strike_step)
             high = atm_strike + (strike_count * strike_step)
@@ -814,7 +814,7 @@ class PaperTrader:
         return None, None
     
     
-    def select_and_open_positions(self, option_chain, target_delta=0.30, quantity=1, hedge_dist=None, submit_orders=True):
+    def select_and_open_positions(self, option_chain, target_delta=0.15, quantity=1, hedge_dist=None, submit_orders=True):
         """
         Select and open delta-neutral positions
         

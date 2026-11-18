@@ -34,7 +34,8 @@ class LiveSPXQuoteProvider:
     def refresh_chain(
         self,
         expiry: date,
-        spot: float,
+        spot: float = 0.0,
+        required_strikes: Optional[list] = None,
         force: bool = False,
     ) -> pd.DataFrame:
         expiry_key = expiry.strftime("%Y%m%d")
@@ -54,6 +55,7 @@ class LiveSPXQuoteProvider:
         raw_chain = self.trader.get_live_option_chain(
             underlying=self.underlying,
             expiry=expiry_key,
+            required_strikes=required_strikes,
         )
 
         if raw_chain is None:

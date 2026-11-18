@@ -30,14 +30,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from live_trading.portfolio.models import Strategy, Fill, StrategyStatus
 from live_trading.portfolio.ledger import LedgerError
 from live_trading.portfolio.market_data import ManualQuoteProvider
+from live_trading.portfolio.live_quotes import LiveSPXQuoteProvider
 from live_trading.portfolio.payoff import build_payoff_curves
 from live_trading.portfolio.repository import PortfolioRepository
 from live_trading.portfolio.valuation import value_open_lots, portfolio_summary
 
 try:
     from IBKRConnectionManager import get_ibkr_connection
+    from paper_trading import PaperTrader
 except ImportError:
     get_ibkr_connection = None
+    PaperTrader = None
 
 
 st.set_page_config(
@@ -56,13 +59,16 @@ def get_repo() -> PortfolioRepository:
 
 
 @st.cache_resource
-def get_quote_provider() -> ManualQuoteProvider:
+def get_quote_provider():
     """
-    Manual provider until live IBKR adapter is connected.
-
-    Future version:
-        return IBKRQuoteAdapter(st.session_state.ibkr_client)
+    Returns LiveSPXQuoteProvider when IBKR is connected,
+    otherwise falls back to ManualQuoteProvider.
     """
+    if get_ibkr_connection is not None and PaperTrader is not None:
+        conn_mgr = get_ibkr_connection(is_paper=False)
+        if conn_mgr.is_connected:
+            trader = PaperTrader(conn_mgr=conn_mgr, is_paper=False)
+            return LiveSPXQuoteProvider(trader=trader, underlying="SPX")
     return ManualQuoteProvider()
 
 
@@ -267,6 +273,7 @@ def render_editable_open_legs(
     ledger,
     strategy_id: str,
     quote_provider,
+    current_spot: float = 0.0,
 ) -> None:
     st.subheader("Open legs")
 
@@ -275,6 +282,19 @@ def render_editable_open_legs(
     if not open_lots:
         st.info("No open legs in this strategy.")
         return
+
+    # If quote_provider supports refresh_chain (e.g. LiveSPXQuoteProvider),
+    # fetch/refresh option chains for all unique open leg expirations
+    if hasattr(quote_provider, "refresh_chain"):
+        expiries = sorted(list(set(lot.expiry for lot in open_lots)))
+        for exp in expiries:
+            exp_strikes = [lot.strike for lot in open_lots if lot.expiry == exp]
+            quote_provider.refresh_chain(
+                expiry=exp,
+                spot=current_spot,
+                required_strikes=exp_strikes,
+                force=False,
+            )
 
     valuations = value_open_lots(
         open_lots,
@@ -346,7 +366,7 @@ def render_editable_open_legs(
         },
     )
 
-    save_col, clear_col = st.columns(2)
+    save_col, refresh_col, clear_col = st.columns(3)
 
     with save_col:
         save_changes = st.button(
@@ -355,11 +375,34 @@ def render_editable_open_legs(
             width="stretch",
         )
 
+    with refresh_col:
+        refresh_chain_btn = st.button(
+            "🔄 Refresh prices from option chain",
+            width="stretch",
+        )
+
     with clear_col:
         clear_marks = st.button(
             "Clear all manual marks",
             width="stretch",
         )
+
+    if refresh_chain_btn:
+        if hasattr(quote_provider, "refresh_chain"):
+            expiries = sorted(list(set(lot.expiry for lot in open_lots)))
+            with st.spinner("Fetching latest option chain prices from IBKR..."):
+                for exp in expiries:
+                    exp_strikes = [lot.strike for lot in open_lots if lot.expiry == exp]
+                    quote_provider.refresh_chain(
+                        expiry=exp,
+                        spot=current_spot,
+                        required_strikes=exp_strikes,
+                        force=True,
+                    )
+            st.success("Option chain prices successfully refreshed!")
+            st.rerun()
+        else:
+            st.warning("Connected quote provider does not support option chain refresh. Please ensure IBKR is connected.")
 
     if save_changes:
         changed_count = 0
@@ -884,6 +927,7 @@ def main() -> None:
         ledger=ledger,
         strategy_id=current_strategy.strategy_id,
         quote_provider=quote_provider,
+        current_spot=current_spot,
     )
 
     render_summary_and_payoff(
