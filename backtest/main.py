@@ -18,7 +18,7 @@ from download_data import download_price_only, download_spx_iv_data
 
 from config import STRATEGY_CONFIG, DATA_PATH, PROCESSED_PATH ,LOG_PATH
 from chain_builder import ChainBuilder
-from strategy import DeltaNeutralStrategy
+# from strategy import DeltaNeutralStrategy
 from duckdb_loader import SPXDuckDB
 
 from IBKRConnectionManager import get_ibkr_connection
@@ -47,8 +47,7 @@ conn_mgr.ensure_connected()
 
 # Get connection info
 info = conn_mgr.get_connection_info()
-print(f"Connection info: {info}")
-# print(f"Primary ID: {info['primary_client_id']}, Current ID: {info['current_client_id']}")
+print(f"Primary ID: {info['primary_client_id']}, Current ID: {info['current_client_id']}")
 
 def check_and_download_missing_data(start_date, end_date):
     """
@@ -136,9 +135,9 @@ def run_for_date_range():
     logger.info("=" * 70)
     
     # Parse configuration
-    start_date_str = STRATEGY_CONFIG.get("start_date", "2025-01-01")
-    end_date_str = STRATEGY_CONFIG.get("end_date", "2026-06-30")
-    dte_days = STRATEGY_CONFIG.get("dte_days", 5)
+    start_date_str = STRATEGY_CONFIG.get("start_date", "2026-03-01")
+    end_date_str = STRATEGY_CONFIG.get("end_date", "2026-03-26")
+    dte_days = STRATEGY_CONFIG.get("dte_days", 0)
     strike_step = STRATEGY_CONFIG.get("strike_step", 5)
     pct_band = STRATEGY_CONFIG.get("pct_band", 0.10)
     risk_free_rate = STRATEGY_CONFIG.get("risk_free_rate", 0.045)
@@ -205,7 +204,11 @@ def run_for_date_range():
         dte_label = "same-day" if dte_days == 0 else f"{dte_days}-day"
         logger.info(f"Window: {window_start_str} to {window_end_str} ({dte_label})")
         
-        strategy = DeltaNeutralStrategy()
+        # strategy = DeltaNeutralStrategy()
+
+        from orb_strategy import ORBStrategy
+
+        strategy = ORBStrategy()
         
         try:
             combined_chain = []
