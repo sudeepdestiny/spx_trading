@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import csv
 import os
+
+import pandas as pd
 import sys
 import time
 from datetime import datetime
@@ -128,20 +130,42 @@ def render_chart(df):
         ),
         secondary_y=False,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=df["sampled_at"], y=df["atm_iv_pct"],
-            mode="lines+markers", name="ATM IV %",
-            line=dict(color="rgba(120, 160, 255, 0.95)"),
-            customdata=df[["iv_basis", "strike"]],
-            hovertemplate=(
-                "%{x|%H:%M:%S} ET<br>ATM IV %{y:.2f}%"
-                "<br>strike %{customdata[1]:,.0f}"
-                "<br>basis %{customdata[0]}<extra></extra>"
+    # Draw each run of one IV basis as its own trace: model greeks and
+    # price-derived IV are different measures, so a continuous line across
+    # a basis switch would draw the switch itself as a volatility move.
+    basis_styles = {
+        "model": ("ATM IV % (model greeks)", "rgba(120, 160, 255, 0.95)", "solid"),
+        "price-fallback": ("ATM IV % (price-derived)", "rgba(190, 140, 255, 0.95)", "dash"),
+    }
+    segments = []
+    current_key = object()
+    for _, row in df.iterrows():
+        key = row["iv_basis"] if pd.notna(row["iv_basis"]) else None
+        if key != current_key:
+            segments.append((key, []))
+            current_key = key
+        segments[-1][1].append(row)
+    shown = set()
+    for key, seg_rows in segments:
+        seg = pd.DataFrame(seg_rows)
+        name, color, dash = basis_styles.get(
+            key, ("ATM IV % (basis unconfirmed)", "rgba(150, 150, 150, 0.95)", "dot"))
+        fig.add_trace(
+            go.Scatter(
+                x=seg["sampled_at"], y=seg["atm_iv_pct"],
+                mode="lines+markers", name=name, legendgroup=str(key),
+                showlegend=key not in shown,
+                line=dict(color=color, dash=dash),
+                customdata=seg[["iv_basis", "strike"]],
+                hovertemplate=(
+                    "%{x|%H:%M:%S} ET<br>ATM IV %{y:.2f}%"
+                    "<br>strike %{customdata[1]:,.0f}"
+                    "<br>basis %{customdata[0]}<extra></extra>"
+                ),
             ),
-        ),
-        secondary_y=True,
-    )
+            secondary_y=True,
+        )
+        shown.add(key)
     fig.update_layout(
         title="VIX and SPX ATM implied volatility, per sample",
         height=440,
@@ -196,11 +220,12 @@ def main():
             host = st.text_input("TWS / Gateway host", value="127.0.0.1")
             port = st.number_input("Port", value=4001, step=1)
             client_id = st.number_input(
-                "Client ID", value=11, step=1,
-                help="The gamma dashboard also defaults to 11. If the "
-                     "trader or the gamma dashboard is connected at the "
-                     "same time, pick a different ID here or a request "
-                     "may time out.",
+                "Client ID", value=0, step=1,
+                help="0 (recommended) picks a free ID automatically from "
+                     "32-999 on every sample: the gateway allows one "
+                     "connection per ID and the trader's app cycles IDs "
+                     "1-31. Set a fixed ID only if you know it is free - "
+                     "the gamma dashboard defaults to 11.",
             )
             md_type_label = st.selectbox(
                 "Market data type",
@@ -292,6 +317,17 @@ def main():
         if latest.source != "demo":
             st.warning(message)
 
+    session_bases = {s.iv_basis for s in samples if s.iv_basis}
+    if len(session_bases) > 1:
+        st.warning(
+            "The IV basis changed during this session (for example IBKR "
+            "stopped delivering model greeks and the panel solved IV from "
+            "prices instead). The two bases are different measures: the "
+            "trend chart draws them as separate lines and the change "
+            "figures compare only samples on the same basis, so a level "
+            "jump across the switch is not a real volatility move."
+        )
+
     df = samples_to_frame(samples)
 
     cols = st.columns(4)
@@ -312,13 +348,18 @@ def main():
         f"ATM IV ({latest.expiry} {latest.atm_strike:,.0f})"
         if latest.atm_strike is not None else "ATM IV"
     ) + _md_suffix(latest.opt_md_type)
+    iv_delta_text = (
+        None if iv_delta is None
+        else f"{iv_delta:+.1f}% vs first {latest.iv_basis or 'unconfirmed-basis'} sample"
+    )
     cols[1].metric(
         iv_label,
         "unavailable" if atm_iv_pct is None else f"{atm_iv_pct:.1f}%",
-        None if iv_delta is None else f"{iv_delta:+.1f}% vs first sample",
+        iv_delta_text,
         help="Mean of the at-the-money call and put implied vol for the "
              "selected expiry, from IBKR model greeks or solved from the "
-             "mid/last price (the table shows which).",
+             "mid/last price (the table shows which). The change is "
+             "measured only against samples on the same basis.",
     )
     cols[2].metric(
         "SPX spot",
@@ -369,7 +410,9 @@ def main():
             "other way round.\n"
             "- **Change since first sample** compares against the first "
             "reading this session captured, not the market open or "
-            "yesterday's close.\n"
+            "yesterday's close. ATM IV change is per basis: model-greeks "
+            "IV and price-derived IV are only ever compared within their "
+            "own basis, so a switch between them never reads as a jump.\n"
             "- Samples are taken only when this page asks for them. "
             "Between samples the panel shows nothing, so a crash between "
             "samples appears as a line jump, not when it happened.\n"
