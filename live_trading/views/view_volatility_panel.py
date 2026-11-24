@@ -127,23 +127,15 @@ def render_chart(df):
             x=df["sampled_at"], y=df["atm_iv_pct"],
             mode="lines+markers", name="ATM IV %",
             line=dict(color="rgba(120, 160, 255, 0.95)"),
-            customdata=df[["iv_basis"]],
+            customdata=df[["iv_basis", "strike"]],
             hovertemplate=(
                 "%{x|%H:%M:%S} ET<br>ATM IV %{y:.2f}%"
+                "<br>strike %{customdata[1]:,.0f}"
                 "<br>basis %{customdata[0]}<extra></extra>"
             ),
         ),
         secondary_y=True,
     )
-    fig.add_trace(
-        go.Scatter(
-            x=df["sampled_at"], y=df["spot"],
-            mode="lines", name="SPX spot",
-            line=dict(color="rgba(150, 150, 150, 0.6)", dash="dot"),
-        ),
-        secondary_y=True,
-    )
-
     fig.update_layout(
         title="VIX and SPX ATM implied volatility, per sample",
         height=440,
@@ -153,7 +145,7 @@ def render_chart(df):
     )
     fig.update_xaxes(title_text="Sample time (ET)")
     fig.update_yaxes(title_text="VIX", secondary_y=False)
-    fig.update_yaxes(title_text="IV % / SPX spot", secondary_y=True)
+    fig.update_yaxes(title_text="IV %", secondary_y=True)
     return fig
 
 
@@ -352,6 +344,10 @@ def main():
             "nearest spot for the chosen expiry. The two move together but "
             "are not the same measure, so a drop in one without the other "
             "is normal.\n"
+            "- **ATM follows spot**: each sample re-centres on the strike "
+            "nearest spot. When spot crosses to a new strike the series "
+            "switches contracts, which can shift the IV level by itself - "
+            "the samples table lists the strike behind each point.\n"
             "- **Change since first sample** compares against the first "
             "reading this session captured, not the market open or "
             "yesterday's close.\n"
