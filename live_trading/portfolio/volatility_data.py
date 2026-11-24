@@ -19,6 +19,7 @@ Two sources:
 
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime
 from typing import List, Optional
@@ -50,6 +51,7 @@ class VolSample:
     opt_time: Optional[datetime] = None  # older of the call/put feed quote times
     opt_md_type: Optional[str] = None    # option quote type IBKR reports ("mixed" if sides differ)
     market_data_type: Optional[str] = None  # requested md type, e.g. "live"
+    client_id: Optional[int] = None    # API client ID the sample was taken with
     warnings: List[str] = field(default_factory=list)
 
     @property
@@ -76,14 +78,22 @@ def pct_change(current: Optional[float], reference: Optional[float]) -> Optional
 def samples_to_frame(samples: List[VolSample]) -> pd.DataFrame:
     """Samples as a table with per-series change since the first sample.
 
-    The first sample in the session is the baseline, labelled honestly in
-    the view - it is not the market open unless sampling started there.
+    The first sample in the session is the VIX baseline, labelled
+    honestly in the view - it is not the market open unless sampling
+    started there. The ATM IV baseline is the first sample *on the same IV
+    basis* as the row: model greeks and price-derived IV are different
+    measures, so a change computed across a basis switch would read the
+    switch itself as a volatility move. The first sample of each basis
+    shows 0% change.
     """
     rows = []
     first_vix = next((s.vix for s in samples if s.vix is not None), None)
-    first_iv = next((s.atm_iv for s in samples if s.atm_iv is not None), None)
+    first_iv_by_basis: dict = {}
     for s in samples:
         atm_iv = s.atm_iv
+        basis_key = s.iv_basis or "unavailable"
+        if atm_iv is not None and basis_key not in first_iv_by_basis:
+            first_iv_by_basis[basis_key] = atm_iv
         rows.append({
             "sampled_at": s.sampled_at,
             "spot": s.spot,
@@ -99,8 +109,10 @@ def samples_to_frame(samples: List[VolSample]) -> pd.DataFrame:
             "put_iv_pct": None if s.put_iv is None else s.put_iv * 100.0,
             "atm_iv_pct": None if atm_iv is None else atm_iv * 100.0,
             "iv_basis": s.iv_basis,
+            "client_id": s.client_id,
             "vix_change_pct": pct_change(s.vix, first_vix),
-            "atm_iv_change_pct": pct_change(atm_iv, first_iv),
+            "atm_iv_change_pct": pct_change(
+                atm_iv, first_iv_by_basis.get(basis_key)),
         })
     return pd.DataFrame(rows)
 
@@ -111,6 +123,33 @@ def samples_to_frame(samples: List[VolSample]) -> pd.DataFrame:
 
 def _positive(value) -> bool:
     return value is not None and np.isfinite(value) and value > 0
+
+
+def _connect(ib, host: str, port: int, client_id: int) -> int:
+    """Connect to TWS / IB Gateway, returning the client ID used.
+
+    client_id 0 picks a free ID automatically: the gateway allows one
+    connection per client ID and TWS itself retries IDs 1-31, so a random
+    ID from 32-999 is tried instead of a fixed default that can collide
+    with another session. A fixed nonzero ID is used as given and any
+    connection failure propagates unchanged.
+    """
+    if client_id == 0:
+        candidates = random.sample(range(32, 1000), 10)
+    else:
+        candidates = [client_id]
+    last_exc: Optional[Exception] = None
+    for candidate in candidates:
+        try:
+            ib.connect(host, port, clientId=candidate, timeout=10)
+            return candidate
+        except (ConnectionError, OSError, TimeoutError) as exc:
+            last_exc = exc
+    raise ConnectionError(
+        "Could not connect to IBKR: no free API client ID after "
+        f"{len(candidates)} attempts. Another session may hold the "
+        "requested ID."
+    ) from last_exc
 
 
 def _years_to_expiry(expiry: date, now_et: Optional[datetime] = None) -> float:
@@ -141,7 +180,7 @@ def sample_live_volatility(
     rate: float = 0.045,
     host: str = "127.0.0.1",
     port: int = 7497,
-    client_id: int = 11,
+    client_id: int = 0,
     market_data_type: int = 1,
     max_wait_seconds: float = 20.0,
 ) -> VolSample:
@@ -151,6 +190,10 @@ def sample_live_volatility(
     market_data_type: 1 live, 2 frozen, 3 delayed, 4 delayed-frozen.
     Delayed modes may omit greeks and/or quotes depending on the account's
     subscriptions; anything not delivered stays None.
+
+    client_id 0 (the default) picks a free API client ID automatically per
+    sample; see _connect. The sample records the ID actually used so the
+    panel can show it.
 
     Requires TWS or IB Gateway running with the API enabled, and SPX/SPXW
     options market-data permissions for live values.
@@ -165,7 +208,7 @@ def sample_live_volatility(
 
     ib = IB()
     try:
-        ib.connect(host, port, clientId=client_id, timeout=10)
+        used_client_id = _connect(ib, host, port, client_id)
         ib.reqMarketDataType(market_data_type)
 
         spx = Index("SPX", "CBOE")
@@ -366,6 +409,7 @@ def sample_live_volatility(
             opt_md_type=opt_md_type,
             market_data_type=md_type_names.get(
                 market_data_type, str(market_data_type)),
+            client_id=used_client_id,
             warnings=warnings,
         )
     finally:
