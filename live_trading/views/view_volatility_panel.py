@@ -64,6 +64,7 @@ def _md_suffix(md_name):
         "delayed": " (delayed)",
         "delayed-frozen": " (delayed)",
         "frozen": " (frozen)",
+        "mixed": " (mixed)",
     }.get(md_name, "")
 
 
@@ -95,6 +96,11 @@ def append_csv(path: str, sample: VolSample) -> None:
             if sample.vix_time else ""
         ),
         "vix_md_type": sample.vix_md_type,
+        "opt_feed_time": (
+            sample.opt_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+            if sample.opt_time else ""
+        ),
+        "opt_md_type": sample.opt_md_type,
         "market_data_type": sample.market_data_type,
     }
     new_file = not os.path.exists(path)
@@ -302,9 +308,12 @@ def main():
     )
     atm_iv_pct = df["atm_iv_pct"].iloc[-1]
     iv_delta = df["atm_iv_change_pct"].iloc[-1]
-    cols[1].metric(
+    iv_label = (
         f"ATM IV ({latest.expiry} {latest.atm_strike:,.0f})"
-        if latest.atm_strike is not None else "ATM IV",
+        if latest.atm_strike is not None else "ATM IV"
+    ) + _md_suffix(latest.opt_md_type)
+    cols[1].metric(
+        iv_label,
         "unavailable" if atm_iv_pct is None else f"{atm_iv_pct:.1f}%",
         None if iv_delta is None else f"{iv_delta:+.1f}% vs first sample",
         help="Mean of the at-the-money call and put implied vol for the "
@@ -325,6 +334,12 @@ def main():
             if latest.vix_time else
             " The feed supplied no VIX quote time; delayed or frozen data "
             "can lag the market."
+        )
+        + (
+            f" Option feed quote time: {latest.opt_time:%Y-%m-%d %H:%M:%S %Z}."
+            if latest.opt_time else
+            " The feed supplied no option quote time, so IV freshness is "
+            "unconfirmed."
         )
     )
 
@@ -348,6 +363,10 @@ def main():
             "nearest spot. When spot crosses to a new strike the series "
             "switches contracts, which can shift the IV level by itself - "
             "the samples table lists the strike behind each point.\n"
+            "- **Freshness labels are per series**: the VIX and the option "
+            "quotes get their own basis and quote-time labels. A live VIX "
+            "timestamp says nothing about option IV freshness, and the "
+            "other way round.\n"
             "- **Change since first sample** compares against the first "
             "reading this session captured, not the market open or "
             "yesterday's close.\n"
