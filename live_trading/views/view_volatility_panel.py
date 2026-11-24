@@ -186,14 +186,37 @@ def render_change_chart(df):
         mode="lines+markers", name="VIX",
         line=dict(color="rgba(255, 140, 60, 0.95)"),
     ))
-    fig.add_trace(go.Scatter(
-        x=df["sampled_at"], y=df["atm_iv_change_pct"],
-        mode="lines+markers", name="ATM IV",
-        line=dict(color="rgba(120, 160, 255, 0.95)"),
-    ))
+    # Segment the ATM IV change line by basis run, like the level chart:
+    # the baseline is per basis, so joining across a switch would draw a
+    # change between two different measures.
+    basis_styles = {
+        "model": ("ATM IV (model greeks)", "rgba(120, 160, 255, 0.95)", "solid"),
+        "price-fallback": ("ATM IV (price-derived)", "rgba(190, 140, 255, 0.95)", "dash"),
+    }
+    segments = []
+    current_key = object()
+    for _, row in df.iterrows():
+        key = row["iv_basis"] if pd.notna(row["iv_basis"]) else None
+        if key != current_key:
+            segments.append((key, []))
+            current_key = key
+        segments[-1][1].append(row)
+    shown = set()
+    for key, seg_rows in segments:
+        seg = pd.DataFrame(seg_rows)
+        name, color, dash = basis_styles.get(
+            key, ("ATM IV (basis unconfirmed)", "rgba(150, 150, 150, 0.95)", "dot"))
+        fig.add_trace(go.Scatter(
+            x=seg["sampled_at"], y=seg["atm_iv_change_pct"],
+            mode="lines+markers", name=name, legendgroup=str(key),
+            showlegend=key not in shown,
+            line=dict(color=color, dash=dash),
+        ))
+        shown.add(key)
     fig.add_hline(y=0, line_color="gray", line_dash="dot")
     fig.update_layout(
-        title="Change since the first sample this session (%)",
+        title=("Change from baseline (%) - VIX vs the session's first "
+               "sample, ATM IV vs the first sample on the same basis"),
         height=300,
         margin=dict(l=20, r=20, t=60, b=20),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
@@ -323,9 +346,10 @@ def main():
             "The IV basis changed during this session (for example IBKR "
             "stopped delivering model greeks and the panel solved IV from "
             "prices instead). The two bases are different measures: the "
-            "trend chart draws them as separate lines and the change "
-            "figures compare only samples on the same basis, so a level "
-            "jump across the switch is not a real volatility move."
+            "charts draw them as separate lines and the change figures "
+            "compare only samples on the same basis, so a level jump "
+            "across the switch cannot be interpreted as a volatility move "
+            "from these mixed bases."
         )
 
     df = samples_to_frame(samples)
@@ -408,11 +432,13 @@ def main():
             "quotes get their own basis and quote-time labels. A live VIX "
             "timestamp says nothing about option IV freshness, and the "
             "other way round.\n"
-            "- **Change since first sample** compares against the first "
-            "reading this session captured, not the market open or "
-            "yesterday's close. ATM IV change is per basis: model-greeks "
-            "IV and price-derived IV are only ever compared within their "
-            "own basis, so a switch between them never reads as a jump.\n"
+            "- **Change from baseline** compares VIX against the first "
+            "reading this session captured and ATM IV against the first "
+            "reading on the same basis - never the market open or "
+            "yesterday's close. Model-greeks IV and price-derived IV are "
+            "only ever compared within their own basis, so a jump across "
+            "a basis switch cannot be interpreted as a volatility move "
+            "from these mixed bases.\n"
             "- Samples are taken only when this page asks for them. "
             "Between samples the panel shows nothing, so a crash between "
             "samples appears as a line jump, not when it happened.\n"
