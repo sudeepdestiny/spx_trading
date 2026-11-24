@@ -47,6 +47,8 @@ class VolSample:
     vix_basis: Optional[str] = None  # "quote" (last index value) or "previous-close"
     vix_time: Optional[datetime] = None  # feed quote time when IBKR supplies one
     vix_md_type: Optional[str] = None    # actual market-data type IBKR reports
+    opt_time: Optional[datetime] = None  # older of the call/put feed quote times
+    opt_md_type: Optional[str] = None    # option quote type IBKR reports ("mixed" if sides differ)
     market_data_type: Optional[str] = None  # requested md type, e.g. "live"
     warnings: List[str] = field(default_factory=list)
 
@@ -91,6 +93,8 @@ def samples_to_frame(samples: List[VolSample]) -> pd.DataFrame:
             "vix_basis": s.vix_basis,
             "vix_feed_time": s.vix_time,
             "vix_md_type": s.vix_md_type,
+            "opt_feed_time": s.opt_time,
+            "opt_md_type": s.opt_md_type,
             "call_iv_pct": None if s.call_iv is None else s.call_iv * 100.0,
             "put_iv_pct": None if s.put_iv is None else s.put_iv * 100.0,
             "atm_iv_pct": None if atm_iv is None else atm_iv * 100.0,
@@ -267,6 +271,8 @@ def sample_live_volatility(
 
         call_iv = put_iv = None
         iv_basis = None
+        opt_times: List[datetime] = []
+        opt_md_types: List[str] = []
         for right in ("C", "P"):
             contract = by_right[right]
             ticker = ib.reqMktData(contract, "", False, False)
@@ -278,6 +284,16 @@ def sample_live_volatility(
                     break
                 if _positive(ticker.bid) and _positive(ticker.ask):
                     break
+            feed_time = getattr(ticker, "time", None)
+            if isinstance(feed_time, datetime):
+                opt_times.append(feed_time)
+            try:
+                md_actual = md_type_names.get(
+                    int(getattr(ticker, "marketDataType", None)))
+            except (TypeError, ValueError):
+                md_actual = None
+            if md_actual:
+                opt_md_types.append(md_actual)
             ib.cancelMktData(contract)
 
             greeks = ticker.modelGreeks
@@ -302,6 +318,23 @@ def sample_live_volatility(
                 call_iv = iv
             else:
                 put_iv = iv
+
+        opt_time = min(opt_times) if opt_times else None
+        opt_md_type = (
+            opt_md_types[0]
+            if opt_md_types and all(t == opt_md_types[0] for t in opt_md_types)
+            else ("mixed" if opt_md_types else None)
+        )
+        if opt_md_type in ("delayed", "delayed-frozen", "frozen", "mixed"):
+            warnings.append(
+                f"Option quotes are {opt_md_type}, not live; the implied "
+                "volatility can lag the market."
+            )
+        if opt_time is None and (call_iv is not None or put_iv is not None):
+            warnings.append(
+                "The feed supplied no option quote time, so IV freshness "
+                "cannot be confirmed."
+            )
 
         if call_iv is None and put_iv is None:
             warnings.append(
@@ -329,6 +362,8 @@ def sample_live_volatility(
             vix_basis=vix_basis,
             vix_time=vix_time,
             vix_md_type=vix_md_type,
+            opt_time=opt_time,
+            opt_md_type=opt_md_type,
             market_data_type=md_type_names.get(
                 market_data_type, str(market_data_type)),
             warnings=warnings,
@@ -384,9 +419,11 @@ def make_demo_sample(
         vix_basis="quote",
         vix_time=datetime.now(ET),
         vix_md_type="live",
+        opt_time=datetime.now(ET),
+        opt_md_type="live",
         market_data_type=None,
         warnings=[
             "Demo mode: every value in this sample is synthetic preview "
             "data, not from IBKR and not market data."
         ],
-      )
+    )
